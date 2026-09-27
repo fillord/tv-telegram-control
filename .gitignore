@@ -1,0 +1,24 @@
+# Credentials & Configuration
+config.json
+*.json.tmp
+.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs
+*.log
+logs/
+*.log.*
+
+# IDE / Editor
+.idea/
+.vscode/settings.json
