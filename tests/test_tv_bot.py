@@ -308,6 +308,28 @@ class DeviceSafetyTests(unittest.TestCase):
             tv_bot._operate_unlocked({}, tv, "on")
         set_sleep.assert_called_once_with({}, tv["id"], False)
 
+    def test_wakeup_reconnects_and_retries_after_timeout(self):
+        tv = sample_tv()
+        tv["mac"] = "AA:BB:CC:DD:EE:FF"
+        adb_results = [
+            (False, "timed out"),
+            (True, "disconnected"),
+            (True, ""),
+        ]
+        with (
+            mock.patch.object(tv_bot, "adb", side_effect=adb_results) as adb,
+            mock.patch.object(tv_bot, "wake_on_lan") as wol,
+            mock.patch.object(tv_bot.time, "sleep"),
+            mock.patch.object(tv_bot, "connect", return_value=("192.168.0.10:5555", "")),
+        ):
+            ok, output = tv_bot.wake_tv_with_retry(
+                {}, tv, "192.168.0.10:5555"
+            )
+        self.assertTrue(ok)
+        self.assertEqual(output, "")
+        wol.assert_called_once()
+        self.assertEqual(adb.call_count, 3)
+
 
 class MonitoringTests(unittest.TestCase):
     def test_monitor_debounces_failure_and_recovery(self):

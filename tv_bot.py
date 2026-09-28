@@ -496,6 +496,40 @@ def apply_keep_awake_settings(cfg, address):
     return True, ""
 
 
+def wake_tv_with_retry(cfg, tv, address):
+    """Wake a TV and recover once from a stuck ADB shell command."""
+    ok, output = adb(
+        cfg, "-s", address, "shell", "input", "keyevent", "224", timeout=6
+    )
+    if ok:
+        return True, output
+
+    adb(cfg, "disconnect", address, timeout=2)
+    logging.warning(
+        'Пробуждение «%s» зависло, выполняется повторное подключение', tv["name"]
+    )
+    if tv.get("mac"):
+        try:
+            wake_on_lan(
+                tv["mac"],
+                tv.get("broadcast", "255.255.255.255"),
+                tv_ip=tv["ip"],
+            )
+            time.sleep(3)
+        except (ValueError, OSError) as exc:
+            logging.warning('Wake-on-LAN для «%s»: %s', tv["name"], exc)
+
+    retry_address, connect_error = connect(cfg, tv, wake=False)
+    if not retry_address:
+        return False, connect_error or output
+    ok, retry_output = adb(
+        cfg, "-s", retry_address, "shell", "input", "keyevent", "224", timeout=8
+    )
+    if not ok:
+        adb(cfg, "disconnect", retry_address, timeout=2)
+    return ok, retry_output
+
+
 def _ensure_tv_awake_unlocked(cfg, tv):
     port = int(tv.get("port", 5555))
     if not is_device_reachable(tv["ip"], port, timeout=1.0) and tv.get("mac"):
@@ -660,7 +694,7 @@ def _operate_unlocked(cfg, tv, action, url_override=None):
         ok, output = adb(cfg, "-s", address, "shell", "input", "keyevent", keycode)
         return f"{label} выполнено" if ok else f"Ошибка: {output[:200]}"
     if action in {"on", "both"}:
-        ok, output = adb(cfg, "-s", address, "shell", "input", "keyevent", "224")
+        ok, output = wake_tv_with_retry(cfg, tv, address)
         if not ok:
             return f"Не удалось разбудить ТВ: {output[:200]}"
     if action == "off":
