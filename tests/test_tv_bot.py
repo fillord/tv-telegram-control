@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -350,6 +351,74 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(tv_bot.availability_transition(state, False, 3, 2), "down")
         self.assertIsNone(tv_bot.availability_transition(state, True, 3, 2))
         self.assertEqual(tv_bot.availability_transition(state, True, 3, 2), "up")
+
+
+class ScheduleTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.config = Path(self.tempdir.name) / "config.json"
+        self.tv = sample_tv()
+        self.tv["schedule"] = {
+            "enabled": True,
+            "on": "09:00",
+            "off": "22:00",
+            "days": [0, 1, 2, 3, 4],
+        }
+        self.stored = {
+            "telegram_token": "token",
+            "allowed_user_ids": [123],
+            "timezone": "Asia/Almaty",
+            "tvs": [self.tv],
+        }
+        self.config.write_text(json.dumps(self.stored), encoding="utf-8")
+        self.config_patch = mock.patch.object(tv_bot, "CONFIG", self.config)
+        self.config_patch.start()
+
+    def tearDown(self):
+        self.config_patch.stop()
+        self.tempdir.cleanup()
+
+    def test_parse_schedule_supports_presets_and_custom_days(self):
+        weekdays = tv_bot.parse_schedule_text("08:30 18:00 будни")
+        self.assertEqual(weekdays["days"], [0, 1, 2, 3, 4])
+        custom = tv_bot.parse_schedule_text("10:00 20:00 пн,ср,пт")
+        self.assertEqual(custom["days"], [0, 2, 4])
+
+    def test_scheduled_on_opens_configured_site_once(self):
+        cfg = dict(self.stored)
+        cfg["allowed_user_ids"] = {123}
+        monday = datetime(2026, 9, 28, 9, 0)
+        with (
+            mock.patch.object(
+                tv_bot,
+                "operate_many",
+                return_value=[(self.tv, "Команда открытия сайта отправлена")],
+            ) as operate,
+            mock.patch.object(tv_bot, "notify_owners"),
+        ):
+            first = tv_bot.run_due_schedules(cfg, monday)
+            second = tv_bot.run_due_schedules(cfg, monday)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(second, [])
+        operate.assert_called_once()
+        self.assertEqual(operate.call_args.args[2], "both")
+        stored = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(stored["tvs"][0]["schedule"]["last_on"], "2026-09-28")
+
+    def test_scheduled_off_uses_standby_action(self):
+        cfg = dict(self.stored)
+        cfg["allowed_user_ids"] = {123}
+        monday = datetime(2026, 9, 28, 22, 0)
+        with (
+            mock.patch.object(
+                tv_bot,
+                "operate_many",
+                return_value=[(self.tv, "Отправлена команда ожидания")],
+            ) as operate,
+            mock.patch.object(tv_bot, "notify_owners"),
+        ):
+            tv_bot.run_due_schedules(cfg, monday)
+        self.assertEqual(operate.call_args.args[2], "off")
 
 
 if __name__ == "__main__":

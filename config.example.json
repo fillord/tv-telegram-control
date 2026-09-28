@@ -11,13 +11,20 @@
   "auto_refresh": true,
   "keep_awake": true,
   "keep_awake_interval_seconds": 60,
+  "timezone": "Asia/Almaty",
   "tvs": [
     {
       "name": "TCL 43P635 — Телевизор 1",
       "ip": "192.168.0.108",
       "port": 5555,
       "url": "https://example.org/tv",
-      "mac": "AA:BB:CC:DD:EE:FF"
+      "mac": "AA:BB:CC:DD:EE:FF",
+      "schedule": {
+        "enabled": true,
+        "on": "09:00",
+        "off": "22:00",
+        "days": [0, 1, 2, 3, 4, 5, 6]
+      }
     },
     {
       "name": "Телевизор 2 (пример)",

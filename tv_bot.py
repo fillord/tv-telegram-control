@@ -19,7 +19,9 @@ import urllib.request
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get("TV_BOT_CONFIG", ROOT / "config.json")).expanduser()
@@ -31,6 +33,8 @@ ADB_LAST_RECOVERY = 0.0
 ADB_RECOVERY_COOLDOWN_SECONDS = 10.0
 PENDING_URL = {}
 PENDING_ADD_TV = {}
+PENDING_SCHEDULE = {}
+WEEKDAY_LABELS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 KEY_ACTIONS = {
     "voldown": ("25", "🔉 Тише"),
     "volup": ("24", "🔊 Громче"),
@@ -129,6 +133,12 @@ def load_config():
     if not isinstance(keep_awake, bool):
         raise ValueError("keep_awake должен быть true или false без кавычек")
     cfg["keep_awake"] = keep_awake
+    timezone_name = str(cfg.get("timezone", "Asia/Almaty")).strip()
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"Неизвестный часовой пояс: {timezone_name}") from exc
+    cfg["timezone"] = timezone_name
     adb_path = Path(
         os.environ.get("TV_BOT_ADB_PATH", cfg.get("adb_path", ""))
     ).expanduser()
@@ -159,6 +169,8 @@ def load_config():
         tv["url"] = validate_url(tv.get("url", ""))
         if tv.get("mac"):
             tv["mac"] = validate_mac(tv["mac"])
+        if "schedule" in tv:
+            tv["schedule"] = normalize_schedule(tv["schedule"])
         tv_id = str(tv.get("id", ""))
         if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", tv_id):
             tv_id = uuid.uuid4().hex[:12]
@@ -277,6 +289,7 @@ def set_bot_commands(cfg):
     commands = [
         {"command": "start", "description": "Главное меню телевизоров"},
         {"command": "addtv", "description": "Добавить телевизор по IP"},
+        {"command": "schedule", "description": "Расписание включения и ожидания"},
         {"command": "screenshot", "description": "Сделать скриншот с экрана ТВ"},
         {"command": "mute", "description": "Включить/выключить звук"},
         {"command": "volup", "description": "Сделать громче"},
@@ -303,6 +316,7 @@ def menu(cfg, statuses=None):
         {"text": "➕ Добавить ТВ", "callback_data": "addtv_start"},
         {"text": "🔄 Обновить статусы", "callback_data": "refresh_menu"}
     ])
+    rows.append([{"text": "🕒 Расписание", "callback_data": "schedule_menu"}])
     return {"inline_keyboard": rows}
 
 
@@ -329,6 +343,7 @@ def actions(target):
          {"text": "🔄 Перезагрузить", "callback_data": f"rebootask:{target}"}],
         [{"text": "📸 Скриншот", "callback_data": f"screenshot:{target}"},
          {"text": "🔗 Сменить сайт", "callback_data": f"seturl:{target}"}],
+        [{"text": "🕒 Расписание", "callback_data": f"schedule:{target}"}],
         [{"text": "🔉 Тише", "callback_data": f"voldown:{target}"},
          {"text": "🔇 Mute", "callback_data": f"mute:{target}"},
          {"text": "🔊 Громче", "callback_data": f"volup:{target}"}],
@@ -357,6 +372,25 @@ def delete_confirmation(target):
     return {"inline_keyboard": [
         [{"text": "⚠️ Да, удалить телевизор", "callback_data": f"delete:{target}"}],
         [{"text": "❌ Отмена", "callback_data": f"select:{target}"}],
+    ]}
+
+
+def schedule_target_menu(cfg):
+    rows = [
+        [{"text": f"📺 {tv['name']}", "callback_data": f"schedule:{tv['id']}"}]
+        for tv in cfg["tvs"]
+    ]
+    if len(cfg["tvs"]) > 1:
+        rows.append([{"text": "📺 Все телевизоры", "callback_data": "schedule:all"}])
+    rows.append([{"text": "↩ Главное меню", "callback_data": "menu"}])
+    return {"inline_keyboard": rows}
+
+
+def schedule_controls(target):
+    return {"inline_keyboard": [
+        [{"text": "✏️ Настроить", "callback_data": f"schedset:{target}"}],
+        [{"text": "⏸ Отключить расписание", "callback_data": f"schedoff:{target}"}],
+        [{"text": "↩ Назад", "callback_data": "schedule_menu"}],
     ]}
 
 
@@ -840,6 +874,141 @@ def validate_url(value):
     return value
 
 
+def validate_clock(value):
+    value = str(value).strip()
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+        raise ValueError("Время должно быть в формате ЧЧ:ММ, например 09:00")
+    return value
+
+
+def parse_schedule_days(value):
+    normalized = re.sub(r"\s+", " ", value.strip().lower().replace("ё", "е"))
+    presets = {
+        "каждый день": list(range(7)),
+        "ежедневно": list(range(7)),
+        "все дни": list(range(7)),
+        "пн-вс": list(range(7)),
+        "будни": list(range(5)),
+        "пн-пт": list(range(5)),
+        "выходные": [5, 6],
+        "сб-вс": [5, 6],
+    }
+    if normalized in presets:
+        return presets[normalized]
+    aliases = {name: index for index, name in enumerate(WEEKDAY_LABELS)}
+    aliases.update({
+        "понедельник": 0, "вторник": 1, "среда": 2, "четверг": 3,
+        "пятница": 4, "суббота": 5, "воскресенье": 6,
+    })
+    parts = [part.strip() for part in re.split(r"[,; ]+", normalized) if part.strip()]
+    try:
+        days = sorted({aliases[part] for part in parts})
+    except KeyError as exc:
+        raise ValueError(
+            "Дни: «каждый день», «будни», «выходные» или список пн,ср,пт"
+        ) from exc
+    if not days:
+        raise ValueError("Укажите хотя бы один день недели")
+    return days
+
+
+def normalize_schedule(schedule):
+    if not isinstance(schedule, dict):
+        raise ValueError("schedule должен быть объектом")
+    enabled = schedule.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("schedule.enabled должен быть true или false")
+    normalized = {
+        "enabled": enabled,
+        "on": validate_clock(schedule.get("on", "09:00")),
+        "off": validate_clock(schedule.get("off", "22:00")),
+        "days": sorted({int(day) for day in schedule.get("days", range(7))}),
+    }
+    if not normalized["days"] or any(day < 0 or day > 6 for day in normalized["days"]):
+        raise ValueError("Дни расписания должны быть числами от 0 до 6")
+    if normalized["on"] == normalized["off"]:
+        raise ValueError("Время включения и ожидания не должно совпадать")
+    for key in ("last_on", "last_off"):
+        if schedule.get(key):
+            normalized[key] = str(schedule[key])
+    return normalized
+
+
+def parse_schedule_text(value):
+    parts = value.strip().split(maxsplit=2)
+    if len(parts) < 2:
+        raise ValueError("Отправьте время включения и ожидания, например 09:00 22:00")
+    on_time = validate_clock(parts[0])
+    off_time = validate_clock(parts[1])
+    if on_time == off_time:
+        raise ValueError("Время включения и ожидания не должно совпадать")
+    days = parse_schedule_days(parts[2] if len(parts) == 3 else "каждый день")
+    return {"enabled": True, "on": on_time, "off": off_time, "days": days}
+
+
+def format_schedule(schedule):
+    if not schedule or not schedule.get("enabled", False):
+        return "отключено"
+    days = schedule.get("days", list(range(7)))
+    if days == list(range(7)):
+        day_label = "каждый день"
+    elif days == list(range(5)):
+        day_label = "будни"
+    elif days == [5, 6]:
+        day_label = "выходные"
+    else:
+        day_label = ",".join(WEEKDAY_LABELS[day] for day in days)
+    return f"включение {schedule['on']}, ожидание {schedule['off']}, {day_label}"
+
+
+def schedule_summary(cfg, target):
+    televisions = cfg["tvs"] if target == "all" else [
+        tv for tv in cfg["tvs"] if tv.get("id") == target
+    ]
+    if not televisions:
+        raise ValueError("Телевизор не найден")
+    lines = [f"Часовой пояс: {cfg.get('timezone', 'Asia/Almaty')}"]
+    lines.extend(
+        f"• {tv['name']}: {format_schedule(tv.get('schedule'))}"
+        for tv in televisions
+    )
+    return "\n".join(lines)
+
+
+def save_schedule(cfg, target, schedule):
+    normalized = normalize_schedule(schedule)
+    with CONFIG_LOCK:
+        with CONFIG.open(encoding="utf-8") as file:
+            stored = json.load(file)
+        televisions = stored.get("tvs", [])
+        matches = televisions if target == "all" else [
+            tv for tv in televisions if tv.get("id") == target
+        ]
+        if not matches:
+            raise ValueError("Телевизор не найден")
+        for tv in matches:
+            tv["schedule"] = dict(normalized)
+        atomic_write_config(stored)
+        cfg["tvs"] = stored["tvs"]
+
+
+def disable_schedule(cfg, target):
+    with CONFIG_LOCK:
+        with CONFIG.open(encoding="utf-8") as file:
+            stored = json.load(file)
+        matches = stored.get("tvs", []) if target == "all" else [
+            tv for tv in stored.get("tvs", []) if tv.get("id") == target
+        ]
+        if not matches:
+            raise ValueError("Телевизор не найден")
+        for tv in matches:
+            current = tv.get("schedule") or {"on": "09:00", "off": "22:00", "days": list(range(7))}
+            current["enabled"] = False
+            tv["schedule"] = normalize_schedule(current)
+        atomic_write_config(stored)
+        cfg["tvs"] = stored["tvs"]
+
+
 def check_site(url):
     request = urllib.request.Request(
         url,
@@ -1010,6 +1179,73 @@ def notify_owners(cfg, message):
             logging.warning("Не удалось отправить уведомление %s: %s", user_id, exc)
 
 
+def mark_schedule_run(cfg, tv_ids, action, date_key):
+    field = f"last_{action}"
+    with CONFIG_LOCK:
+        with CONFIG.open(encoding="utf-8") as file:
+            stored = json.load(file)
+        for tv in stored.get("tvs", []):
+            if tv.get("id") in tv_ids and isinstance(tv.get("schedule"), dict):
+                tv["schedule"][field] = date_key
+        atomic_write_config(stored)
+        cfg["tvs"] = stored["tvs"]
+
+
+def run_due_schedules(cfg, now=None):
+    timezone = ZoneInfo(cfg.get("timezone", "Asia/Almaty"))
+    if now is None:
+        now = datetime.now(timezone)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone)
+    else:
+        now = now.astimezone(timezone)
+    minute = now.strftime("%H:%M")
+    date_key = now.strftime("%Y-%m-%d")
+    weekday = now.weekday()
+    with CONFIG_LOCK:
+        televisions = [dict(tv) for tv in cfg.get("tvs", [])]
+
+    completed = []
+    for schedule_action, tv_action in (("on", "both"), ("off", "off")):
+        due = []
+        for tv in televisions:
+            schedule = tv.get("schedule")
+            if not isinstance(schedule, dict) or not schedule.get("enabled", False):
+                continue
+            if weekday not in schedule.get("days", []) or schedule.get(schedule_action) != minute:
+                continue
+            if schedule.get(f"last_{schedule_action}") == date_key:
+                continue
+            due.append(tv)
+        if not due:
+            continue
+        results = operate_many(cfg, due, tv_action)
+        mark_schedule_run(cfg, {tv["id"] for tv in due}, schedule_action, date_key)
+        completed.extend((schedule_action, tv, result) for tv, result in results)
+        label = "включение + сайт" if schedule_action == "on" else "ожидание"
+        notify_owners(
+            cfg,
+            "🕒 Расписание: " + label + "\n" +
+            "\n".join(f"{tv['name']}: {result}" for tv, result in results),
+        )
+    return completed
+
+
+def _schedule_loop_forever(cfg):
+    while True:
+        run_due_schedules(cfg)
+        time.sleep(15)
+
+
+def schedule_loop(cfg):
+    while True:
+        try:
+            _schedule_loop_forever(cfg)
+        except Exception:
+            logging.exception("Планировщик аварийно перезапускается")
+            time.sleep(10)
+
+
 def _refresh_loop_forever(cfg):
     pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="refresh")
     while True:
@@ -1175,17 +1411,20 @@ def process(cfg, update):
         if text.startswith("/start") or text == "/menu":
             PENDING_URL.pop(user_id, None)
             PENDING_ADD_TV.pop(user_id, None)
+            PENDING_SCHEDULE.pop(user_id, None)
             send(cfg, chat_id, "Выберите телевизор:", menu(cfg))
             return
         if text == "/cancel":
             PENDING_URL.pop(user_id, None)
             PENDING_ADD_TV.pop(user_id, None)
+            PENDING_SCHEDULE.pop(user_id, None)
             send(cfg, chat_id, "Действие отменено.", menu(cfg))
             return
         cmd_parts = text.split()
         cmd = cmd_parts[0].lower().split("@")[0] if cmd_parts else ""
         if cmd == "/addtv":
             PENDING_URL.pop(user_id, None)
+            PENDING_SCHEDULE.pop(user_id, None)
             arg = text[len(cmd_parts[0]):].strip()
             if arg:
                 try:
@@ -1211,6 +1450,19 @@ def process(cfg, update):
                     "Для отмены отправьте /cancel."
                 )
                 return
+        if cmd == "/schedule":
+            PENDING_URL.pop(user_id, None)
+            PENDING_ADD_TV.pop(user_id, None)
+            if len(cfg["tvs"]) == 1:
+                target = cfg["tvs"][0]["id"]
+                send(
+                    cfg, chat_id,
+                    "🕒 Расписание\n" + schedule_summary(cfg, target),
+                    schedule_controls(target),
+                )
+            else:
+                send(cfg, chat_id, "Выберите телевизор для расписания:", schedule_target_menu(cfg))
+            return
         if cmd in {"/screenshot", "/shot", "/screencap"}:
             PENDING_URL.pop(user_id, None)
             PENDING_ADD_TV.pop(user_id, None)
@@ -1293,6 +1545,29 @@ def process(cfg, update):
             results = operate_many(cfg, target_tvs, act)
             formatted = [f'{tv["name"]}: {res}' for tv, res in results]
             send(cfg, chat_id, "\n".join(formatted))
+            return
+        schedule_target = PENDING_SCHEDULE.get(user_id)
+        if schedule_target is not None:
+            try:
+                schedule = parse_schedule_text(text)
+                save_schedule(cfg, schedule_target, schedule)
+            except (ValueError, OSError, json.JSONDecodeError) as exc:
+                send(
+                    cfg, chat_id,
+                    f"❌ Расписание не сохранено: {exc}\n\n"
+                    "Пример: 09:00 22:00 каждый день\n"
+                    "Или: 08:30 18:00 будни\n"
+                    "Для отмены отправьте /cancel.",
+                )
+                return
+            PENDING_SCHEDULE.pop(user_id, None)
+            send(
+                cfg, chat_id,
+                "✅ Расписание сохранено. В запланированное время включения "
+                "телевизор автоматически откроет заданный сайт.\n\n" +
+                schedule_summary(cfg, schedule_target),
+                schedule_controls(schedule_target),
+            )
             return
         target = PENDING_URL.get(user_id)
         if target is not None:
@@ -1435,6 +1710,7 @@ def process(cfg, update):
     data = callback.get("data", "")
     if data == "addtv_start":
         PENDING_URL.pop(user_id, None)
+        PENDING_SCHEDULE.pop(user_id, None)
         PENDING_ADD_TV[user_id] = {"step": "ip"}
         send(
             cfg, chat_id,
@@ -1468,6 +1744,7 @@ def process(cfg, update):
     if data == "refresh_menu":
         PENDING_URL.pop(user_id, None)
         PENDING_ADD_TV.pop(user_id, None)
+        PENDING_SCHEDULE.pop(user_id, None)
         msg_id = callback.get("message", {}).get("message_id")
         statuses = get_all_tv_statuses(cfg)
         now_str = time.strftime("%H:%M:%S")
@@ -1480,12 +1757,19 @@ def process(cfg, update):
     if data == "menu":
         PENDING_URL.pop(user_id, None)
         PENDING_ADD_TV.pop(user_id, None)
+        PENDING_SCHEDULE.pop(user_id, None)
         msg_id = callback.get("message", {}).get("message_id")
         statuses = get_all_tv_statuses(cfg)
         if msg_id:
             edit_message(cfg, chat_id, msg_id, "Выберите телевизор:", menu(cfg, statuses=statuses))
         else:
             send(cfg, chat_id, "Выберите телевизор:", menu(cfg, statuses=statuses))
+        return
+    if data == "schedule_menu":
+        PENDING_URL.pop(user_id, None)
+        PENDING_ADD_TV.pop(user_id, None)
+        PENDING_SCHEDULE.pop(user_id, None)
+        send(cfg, chat_id, "Выберите телевизор для расписания:", schedule_target_menu(cfg))
         return
     try:
         action, target = data.split(":", 1)
@@ -1512,6 +1796,43 @@ def process(cfg, update):
                 "Выберите действие:"
             )
             send(cfg, chat_id, header, actions(target))
+        return
+    if action == "schedule":
+        send(
+            cfg, chat_id,
+            "🕒 Расписание\n" + schedule_summary(cfg, target),
+            schedule_controls(target),
+        )
+        return
+    if action == "schedset":
+        PENDING_URL.pop(user_id, None)
+        PENDING_ADD_TV.pop(user_id, None)
+        PENDING_SCHEDULE[user_id] = target
+        label = "всех телевизоров" if target == "all" else tvs[0]["name"]
+        send(
+            cfg, chat_id,
+            f"Настройка расписания для {label}.\n\n"
+            "Отправьте одним сообщением:\n"
+            "ВРЕМЯ_ВКЛЮЧЕНИЯ ВРЕМЯ_ОЖИДАНИЯ ДНИ\n\n"
+            "Примеры:\n"
+            "09:00 22:00 каждый день\n"
+            "08:30 18:00 будни\n"
+            "10:00 20:00 пн,ср,пт\n\n"
+            "Часовой пояс: " + cfg.get("timezone", "Asia/Almaty") + "\n"
+            "Для отмены отправьте /cancel.",
+        )
+        return
+    if action == "schedoff":
+        try:
+            disable_schedule(cfg, target)
+            send(
+                cfg, chat_id,
+                "⏸ Расписание отключено. Ручное управление продолжает работать.\n\n" +
+                schedule_summary(cfg, target),
+                schedule_controls(target),
+            )
+        except Exception as exc:
+            send(cfg, chat_id, f"Не удалось отключить расписание: {exc}")
         return
     if action == "rebootask":
         label = "все телевизоры" if target == "all" else tvs[0]["name"]
@@ -1612,13 +1933,14 @@ def main():
     configure_logging()
     cfg = load_config()
     set_bot_commands(cfg)
-    # Skip commands accumulated while the Mac was offline.
+    # Skip commands accumulated while the bot was offline.
     old = telegram(cfg, "getUpdates", {"offset": -1, "timeout": 0})
     offset = old[-1]["update_id"] + 1 if old else None
     if cfg["auto_refresh"]:
         threading.Thread(target=refresh_loop, args=(cfg,), daemon=True).start()
     if cfg["keep_awake"]:
         threading.Thread(target=keep_awake_loop, args=(cfg,), daemon=True).start()
+    threading.Thread(target=schedule_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=healthcheck_loop, args=(cfg,), daemon=True).start()
     logging.info("Бот работает. Для остановки нажмите Ctrl+C.")
     dispatcher = UpdateDispatcher(max_workers=10)
