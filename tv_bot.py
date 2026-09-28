@@ -338,7 +338,7 @@ def screenshot_menu(cfg, statuses=None):
     return {"inline_keyboard": rows}
 
 
-def actions(target):
+def actions(cfg, target, tv=None):
     rows = [
         [{"text": "▶ Включить", "callback_data": f"on:{target}"},
          {"text": "⏸ Ожидание", "callback_data": f"off:{target}"}],
@@ -361,6 +361,11 @@ def actions(target):
          {"text": "🏠 Домой", "callback_data": f"home:{target}"}],
     ]
     if target != "all":
+        refresh_enabled = tv.get("auto_refresh", cfg.get("auto_refresh", False)) if tv else False
+        rows.append([{
+            "text": f"🔁 Автообновление этого ТВ: {'ВКЛ' if refresh_enabled else 'ВЫКЛ'}",
+            "callback_data": f"tvrefresh:{target}",
+        }])
         rows.append([{"text": "🗑 Удалить этот ТВ", "callback_data": f"deleteask:{target}"}])
     rows.append([{"text": "↩ Выбрать ТВ", "callback_data": "menu"}])
     return {"inline_keyboard": rows}
@@ -1176,6 +1181,25 @@ def set_auto_refresh(cfg, enabled):
         cfg["auto_refresh"] = value
 
 
+def set_tv_auto_refresh(cfg, tv_id, enabled):
+    """Persist a per-TV override for periodic browser refresh."""
+    value = bool(enabled)
+    with CONFIG_LOCK:
+        with CONFIG.open(encoding="utf-8") as file:
+            stored = json.load(file)
+        stored_tv = next(
+            (tv for tv in stored.get("tvs", []) if tv.get("id") == tv_id), None
+        )
+        if stored_tv is None:
+            raise ValueError("Телевизор не найден")
+        stored_tv["auto_refresh"] = value
+        atomic_write_config(stored)
+        for current_tv in cfg.get("tvs", []):
+            if current_tv.get("id") == tv_id:
+                current_tv["auto_refresh"] = value
+                break
+
+
 def refresh_url(url):
     parsed = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -1268,12 +1292,13 @@ def _refresh_loop_forever(cfg):
         with CONFIG_LOCK:
             televisions = [dict(tv) for tv in cfg["tvs"]]
             interval = cfg["refresh_interval_seconds"]
-            enabled = cfg.get("auto_refresh", False)
-        if enabled and televisions:
+            default_enabled = cfg.get("auto_refresh", False)
+        refresh_tvs = [tv for tv in televisions if tv.get("auto_refresh", default_enabled)]
+        if refresh_tvs:
             # Smart Refresh: обновляем только те ТВ, которые реально бодрствуют (статус 'on')
             # Это исключает пробуждение спящих телевизоров командой am start
-            statuses = list(pool.map(lambda t: get_tv_status(cfg, t)[0], televisions))
-            awake_tvs = [tv for tv, st in zip(televisions, statuses) if st == "on"]
+            statuses = list(pool.map(lambda t: get_tv_status(cfg, t)[0], refresh_tvs))
+            awake_tvs = [tv for tv, st in zip(refresh_tvs, statuses) if st == "on"]
             if awake_tvs:
                 jobs = {
                     pool.submit(operate, cfg, tv, "web", refresh_url(tv["url"])): tv
@@ -1822,7 +1847,7 @@ def process(cfg, update):
         return
     if action == "select":
         if target == "all":
-            send(cfg, chat_id, "📺 Управление всеми телевизорами:", actions(target))
+            send(cfg, chat_id, "📺 Управление всеми телевизорами:", actions(cfg, target))
         else:
             tv = tvs[0]
             code, label, icon = get_tv_status(cfg, tv)
@@ -1833,7 +1858,22 @@ def process(cfg, update):
                 f"Сайт: {tv['url']}\n\n"
                 "Выберите действие:"
             )
-            send(cfg, chat_id, header, actions(target))
+            send(cfg, chat_id, header, actions(cfg, target, tv))
+        return
+    if action == "tvrefresh" and target != "all":
+        tv = tvs[0]
+        enabled = not tv.get("auto_refresh", cfg.get("auto_refresh", False))
+        set_tv_auto_refresh(cfg, tv["id"], enabled)
+        text = (
+            f"🔁 {tv['name']}: автообновление страниц включено."
+            if enabled else
+            f"⏸ {tv['name']}: автообновление страниц выключено."
+        )
+        msg_id = callback.get("message", {}).get("message_id")
+        if msg_id:
+            edit_message(cfg, chat_id, msg_id, text, actions(cfg, target, tv))
+        else:
+            send(cfg, chat_id, text, actions(cfg, target, tv))
         return
     if action == "schedule":
         send(

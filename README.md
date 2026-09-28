@@ -69,6 +69,7 @@ chmod 600 data/config.json
       "port": 5555,
       "url": "https://example.org/tv",
       "mac": "AA:BB:CC:DD:EE:FF",
+      "auto_refresh": true,
       "schedule": {
         "enabled": true,
         "on": "09:00",

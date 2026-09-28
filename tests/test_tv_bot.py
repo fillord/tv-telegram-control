@@ -179,6 +179,22 @@ class CallbackTests(unittest.TestCase):
         self.assertTrue(any("Автообновление страниц: ВКЛ" in button["text"]
                             for row in keyboard for button in row))
 
+    def test_auto_refresh_can_be_enabled_for_one_tv(self):
+        def enable(cfg, tv_id, value):
+            self.assertEqual(tv_id, "tv000001")
+            cfg["tvs"][0]["auto_refresh"] = value
+
+        with (
+            mock.patch.object(tv_bot, "telegram"),
+            mock.patch.object(tv_bot, "set_tv_auto_refresh", side_effect=enable) as setter,
+            mock.patch.object(tv_bot, "edit_message") as edit,
+        ):
+            tv_bot.process(self.cfg, self.callback("tvrefresh:tv000001"))
+        setter.assert_called_once_with(self.cfg, "tv000001", True)
+        keyboard = edit.call_args.args[4]["inline_keyboard"]
+        self.assertTrue(any("Автообновление этого ТВ: ВКЛ" in button["text"]
+                            for row in keyboard for button in row))
+
 
 class DispatcherTests(unittest.TestCase):
     def test_updates_are_ordered_per_user(self):
