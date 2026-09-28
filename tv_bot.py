@@ -1322,11 +1322,14 @@ def _healthcheck_loop_forever(cfg):
 
         tv_checks = {}
         if televisions:
+            active_tvs = [tv for tv in televisions if not tv.get("manual_sleep", False)]
             tv_results = list(pool.map(
                 lambda t: is_device_reachable(t["ip"], t.get("port", 5555), timeout=1.0),
-                televisions
+                active_tvs
             ))
-            tv_checks = {tv["id"]: ok for tv, ok in zip(televisions, tv_results)}
+            tv_checks = {tv["id"]: ok for tv, ok in zip(active_tvs, tv_results)}
+            # Intentional standby is not an outage, even if the TV closes ADB port 5555.
+            tv_checks.update({tv["id"]: True for tv in televisions if tv.get("manual_sleep", False)})
 
         for url, names in sites.items():
             available, detail = checks.get(url, (False, "Не проверено"))
@@ -1453,6 +1456,7 @@ def process(cfg, update):
         if cmd == "/schedule":
             PENDING_URL.pop(user_id, None)
             PENDING_ADD_TV.pop(user_id, None)
+            PENDING_SCHEDULE.pop(user_id, None)
             if len(cfg["tvs"]) == 1:
                 target = cfg["tvs"][0]["id"]
                 send(
@@ -1466,6 +1470,7 @@ def process(cfg, update):
         if cmd in {"/screenshot", "/shot", "/screencap"}:
             PENDING_URL.pop(user_id, None)
             PENDING_ADD_TV.pop(user_id, None)
+            PENDING_SCHEDULE.pop(user_id, None)
             arg = text[len(cmd_parts[0]):].strip()
             if not arg:
                 if len(cfg["tvs"]) == 1:
@@ -1516,6 +1521,7 @@ def process(cfg, update):
         cmd_action = cmd.lstrip("/")
         if cmd_action in KEY_ACTIONS or cmd_action in {"ok", "vol+", "vol-"}:
             PENDING_URL.pop(user_id, None)
+            PENDING_SCHEDULE.pop(user_id, None)
             act = "enter" if cmd_action == "ok" else ("volup" if cmd_action == "vol+" else ("voldown" if cmd_action == "vol-" else cmd_action))
             arg = text[len(cmd_parts[0]):].strip()
             if arg:
@@ -1853,6 +1859,7 @@ def process(cfg, update):
             send(cfg, chat_id, f"Ошибка удаления: {exc}", menu(cfg))
         return
     if action == "seturl":
+        PENDING_SCHEDULE.pop(user_id, None)
         PENDING_URL[user_id] = target
         label = "всех телевизоров" if target == "all" else tvs[0]["name"]
         send(
