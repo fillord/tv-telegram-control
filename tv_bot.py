@@ -907,10 +907,17 @@ def parse_addtv_arguments(value):
     url = None
     if remaining and remaining[-1].lower().startswith(("https://", "http://")):
         url = validate_url(remaining.pop())
+    mac = None
+    if remaining:
+        candidate = remaining[0]
+        if re.fullmatch(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", candidate):
+            mac = validate_mac(remaining.pop(0))
+        elif candidate.count(":") >= 2 or candidate.count("-") >= 5:
+            mac = validate_mac(candidate)
     name = " ".join(remaining).strip() or f"Телевизор {ip}"
     if len(name) > 60:
         raise ValueError("Название должно быть не длиннее 60 символов")
-    return ip, port, name, url
+    return ip, port, mac, name, url
 
 
 def add_tv(cfg, name, ip, port=5555, url=None, mac=None):
@@ -926,6 +933,12 @@ def add_tv(cfg, name, ip, port=5555, url=None, mac=None):
             stored = json.load(file)
         if any(tv.get("ip") == ip and int(tv.get("port", 5555)) == port for tv in stored.get("tvs", [])):
             raise ValueError(f"Телевизор {ip}:{port} уже добавлен")
+        normalized_mac = validate_mac(mac) if mac else None
+        if normalized_mac and any(
+            tv.get("mac", "").upper().replace("-", ":") == normalized_mac
+            for tv in stored.get("tvs", [])
+        ):
+            raise ValueError(f"Телевизор с MAC {normalized_mac} уже добавлен")
         default_site = stored["tvs"][0]["url"] if stored.get("tvs") else "https://example.org/tv"
         new_tv = {
             "id": uuid.uuid4().hex[:12],
@@ -934,8 +947,8 @@ def add_tv(cfg, name, ip, port=5555, url=None, mac=None):
             "port": port,
             "url": validate_url(url or default_site),
         }
-        if mac:
-            new_tv["mac"] = validate_mac(mac)
+        if normalized_mac:
+            new_tv["mac"] = normalized_mac
         stored.setdefault("tvs", []).append(new_tv)
         atomic_write_config(stored)
         cfg["tvs"] = stored["tvs"]
@@ -1176,12 +1189,12 @@ def process(cfg, update):
             arg = text[len(cmd_parts[0]):].strip()
             if arg:
                 try:
-                    ip, port, name, url = parse_addtv_arguments(arg)
+                    ip, port, mac, name, url = parse_addtv_arguments(arg)
                 except ValueError as exc:
                     send(cfg, chat_id, f"❌ Ошибка: {exc}")
                     return
                 try:
-                    new_tv = add_tv(cfg, name, ip, port=port, url=url)
+                    new_tv = add_tv(cfg, name, ip, port=port, url=url, mac=mac)
                 except Exception as exc:
                     send(cfg, chat_id, f"Не удалось добавить ТВ: {exc}")
                     return
@@ -1194,7 +1207,7 @@ def process(cfg, update):
                 send(
                     cfg, chat_id,
                     "➕ Добавление нового телевизора\n\n"
-                    "Шаг 1 из 3: Отправьте IP-адрес телевизора (например: 192.168.0.120 или 192.168.0.120:5555).\n\n"
+                    "Шаг 1 из 4: Отправьте IP-адрес телевизора (например: 192.168.0.120 или 192.168.0.120:5555).\n\n"
                     "Для отмены отправьте /cancel."
                 )
                 return
@@ -1334,11 +1347,34 @@ def process(cfg, update):
                 reach_note = " 🟢 (В сети)" if reachable else " 🔴 (Сейчас не в сети — настройки сохранятся)"
                 add_state["ip"] = ip
                 add_state["port"] = port
-                add_state["step"] = "name"
+                add_state["step"] = "mac"
                 send(
                     cfg, chat_id,
                     f"✅ IP принят: {ip}:{port}{reach_note}\n\n"
-                    "Шаг 2 из 3: Отправьте понятное название для этого ТВ (например: TCL Конференц-зал или Кухня):\n\n"
+                    "Шаг 2 из 4: Отправьте MAC-адрес телевизора "
+                    "(например: AA:BB:CC:DD:EE:FF):\n\n"
+                    "Для отмены отправьте /cancel."
+                )
+                return
+            elif step == "mac":
+                try:
+                    mac = validate_mac(text)
+                except ValueError as exc:
+                    send(cfg, chat_id, f"❌ Ошибка: {exc}\nОтправьте MAC ещё раз или /cancel.")
+                    return
+                if any(
+                    tv.get("mac", "").upper().replace("-", ":") == mac
+                    for tv in cfg["tvs"]
+                ):
+                    send(cfg, chat_id, f"❌ Телевизор с MAC {mac} уже добавлен. Отправьте другой MAC или /cancel.")
+                    return
+                add_state["mac"] = mac
+                add_state["step"] = "name"
+                send(
+                    cfg, chat_id,
+                    f"✅ MAC принят: {mac}\n\n"
+                    "Шаг 3 из 4: Отправьте понятное название для этого ТВ "
+                    "(например: TCL Конференц-зал или Кухня):\n\n"
                     "Для отмены отправьте /cancel."
                 )
                 return
@@ -1359,7 +1395,7 @@ def process(cfg, update):
                 send(
                     cfg, chat_id,
                     f"✅ Название принято: «{name}»\n\n"
-                    "Шаг 3 из 3: Отправьте HTTPS-ссылку сайта для ТВ (начинающуюся с https://), "
+                    "Шаг 4 из 4: Отправьте HTTPS-ссылку сайта для ТВ (начинающуюся с https://), "
                     f"либо нажмите кнопку ниже для ссылки по умолчанию:\n{def_url}\n\n"
                     "Для отмены отправьте /cancel.",
                     markup=markup
@@ -1381,7 +1417,10 @@ def process(cfg, update):
                     return
                 data = PENDING_ADD_TV.pop(user_id)
                 try:
-                    new_tv = add_tv(cfg, data["name"], data["ip"], port=data["port"], url=url)
+                    new_tv = add_tv(
+                        cfg, data["name"], data["ip"], port=data["port"],
+                        url=url, mac=data.get("mac")
+                    )
                 except Exception as exc:
                     send(cfg, chat_id, f"Не удалось добавить ТВ: {exc}")
                     return
@@ -1400,7 +1439,7 @@ def process(cfg, update):
         send(
             cfg, chat_id,
             "➕ Добавление нового телевизора\n\n"
-            "Шаг 1 из 3: Отправьте IP-адрес телевизора (например: 192.168.0.120 или 192.168.0.120:5555).\n\n"
+            "Шаг 1 из 4: Отправьте IP-адрес телевизора (например: 192.168.0.120 или 192.168.0.120:5555).\n\n"
             "Для отмены отправьте /cancel."
         )
         return
@@ -1408,7 +1447,10 @@ def process(cfg, update):
         add_state = PENDING_ADD_TV.pop(user_id, None)
         if add_state and add_state.get("name") and add_state.get("ip"):
             try:
-                new_tv = add_tv(cfg, add_state["name"], add_state["ip"], port=add_state.get("port", 5555))
+                new_tv = add_tv(
+                    cfg, add_state["name"], add_state["ip"],
+                    port=add_state.get("port", 5555), mac=add_state.get("mac")
+                )
                 send(
                     cfg, chat_id,
                     f"🎉 Телевизор «{new_tv['name']}» ({new_tv['ip']}:{new_tv['port']}) успешно добавлен!",

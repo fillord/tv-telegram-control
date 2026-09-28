@@ -76,19 +76,30 @@ class ConfigTests(unittest.TestCase):
 
 class ParsingTests(unittest.TestCase):
     def test_quick_add_supports_multiword_name(self):
-        ip, port, name, url = tv_bot.parse_addtv_arguments(
+        ip, port, mac, name, url = tv_bot.parse_addtv_arguments(
             "192.168.0.120 TCL Конференц зал"
         )
         self.assertEqual((ip, port), ("192.168.0.120", 5555))
+        self.assertIsNone(mac)
         self.assertEqual(name, "TCL Конференц зал")
         self.assertIsNone(url)
 
     def test_quick_add_supports_url_as_last_argument(self):
-        ip, port, name, url = tv_bot.parse_addtv_arguments(
+        ip, port, mac, name, url = tv_bot.parse_addtv_arguments(
             "192.168.0.120:5566 TCL Зал https://example.com/tv"
         )
         self.assertEqual((ip, port), ("192.168.0.120", 5566))
+        self.assertIsNone(mac)
         self.assertEqual(name, "TCL Зал")
+        self.assertEqual(url, "https://example.com/tv")
+
+    def test_quick_add_supports_mac_name_and_url(self):
+        ip, port, mac, name, url = tv_bot.parse_addtv_arguments(
+            "192.168.0.120 08-c3-b3-5a-90-3d TCL Вход https://example.com/tv"
+        )
+        self.assertEqual((ip, port), ("192.168.0.120", 5555))
+        self.assertEqual(mac, "08:C3:B3:5A:90:3D")
+        self.assertEqual(name, "TCL Вход")
         self.assertEqual(url, "https://example.com/tv")
 
     def test_ipv6_is_rejected_because_adb_addresses_are_ipv4(self):
