@@ -3,7 +3,7 @@
   "allowed_user_ids": [
     123456789
   ],
-  "adb_path": "/Users/USERNAME/Downloads/platform-tools/adb",
+  "adb_path": "/usr/bin/adb",
   "refresh_interval_seconds": 60,
   "healthcheck_interval_seconds": 60,
   "healthcheck_failure_threshold": 3,

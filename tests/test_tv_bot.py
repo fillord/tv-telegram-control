@@ -95,10 +95,10 @@ class ParsingTests(unittest.TestCase):
 
     def test_quick_add_supports_mac_name_and_url(self):
         ip, port, mac, name, url = tv_bot.parse_addtv_arguments(
-            "192.168.0.120 08-c3-b3-5a-90-3d TCL Вход https://example.com/tv"
+            "192.168.0.120 02-00-00-00-00-01 TCL Вход https://example.com/tv"
         )
         self.assertEqual((ip, port), ("192.168.0.120", 5555))
-        self.assertEqual(mac, "08:C3:B3:5A:90:3D")
+        self.assertEqual(mac, "02:00:00:00:00:01")
         self.assertEqual(name, "TCL Вход")
         self.assertEqual(url, "https://example.com/tv")
 
