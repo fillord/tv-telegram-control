@@ -8,7 +8,7 @@
   "healthcheck_interval_seconds": 60,
   "healthcheck_failure_threshold": 3,
   "healthcheck_recovery_threshold": 2,
-  "auto_refresh": true,
+  "auto_refresh": false,
   "keep_awake": true,
   "keep_awake_interval_seconds": 60,
   "timezone": "Asia/Almaty",

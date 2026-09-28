@@ -125,7 +125,7 @@ def load_config():
     cfg["keep_awake_interval_seconds"] = max(
         30, int(cfg.get("keep_awake_interval_seconds", 60))
     )
-    auto_refresh = cfg.get("auto_refresh", True)
+    auto_refresh = cfg.get("auto_refresh", False)
     if not isinstance(auto_refresh, bool):
         raise ValueError("auto_refresh должен быть true или false без кавычек")
     cfg["auto_refresh"] = auto_refresh
@@ -317,6 +317,11 @@ def menu(cfg, statuses=None):
         {"text": "🔄 Обновить статусы", "callback_data": "refresh_menu"}
     ])
     rows.append([{"text": "🕒 Расписание", "callback_data": "schedule_menu"}])
+    auto_refresh_label = "ВКЛ" if cfg.get("auto_refresh", False) else "ВЫКЛ"
+    rows.append([{
+        "text": f"🔁 Автообновление страниц: {auto_refresh_label}",
+        "callback_data": "toggle_auto_refresh",
+    }])
     return {"inline_keyboard": rows}
 
 
@@ -1160,6 +1165,17 @@ def set_manual_sleep(cfg, tv_id, enabled):
                 break
 
 
+def set_auto_refresh(cfg, enabled):
+    """Persist and apply periodic browser refresh without restarting the bot."""
+    value = bool(enabled)
+    with CONFIG_LOCK:
+        with CONFIG.open(encoding="utf-8") as file:
+            stored = json.load(file)
+        stored["auto_refresh"] = value
+        atomic_write_config(stored)
+        cfg["auto_refresh"] = value
+
+
 def refresh_url(url):
     parsed = urllib.parse.urlsplit(url)
     query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
@@ -1252,7 +1268,8 @@ def _refresh_loop_forever(cfg):
         with CONFIG_LOCK:
             televisions = [dict(tv) for tv in cfg["tvs"]]
             interval = cfg["refresh_interval_seconds"]
-        if televisions:
+            enabled = cfg.get("auto_refresh", False)
+        if enabled and televisions:
             # Smart Refresh: обновляем только те ТВ, которые реально бодрствуют (статус 'on')
             # Это исключает пробуждение спящих телевизоров командой am start
             statuses = list(pool.map(lambda t: get_tv_status(cfg, t)[0], televisions))
@@ -1760,6 +1777,21 @@ def process(cfg, update):
         else:
             send(cfg, chat_id, text, menu(cfg, statuses=statuses))
         return
+    if data == "toggle_auto_refresh":
+        enabled = not cfg.get("auto_refresh", False)
+        set_auto_refresh(cfg, enabled)
+        msg_id = callback.get("message", {}).get("message_id")
+        statuses = get_all_tv_statuses(cfg)
+        text = (
+            "Автообновление страниц включено. Сайт будет открываться заново через заданный интервал."
+            if enabled else
+            "Автообновление страниц выключено. Плейлисты и открытые страницы не будут перезапускаться."
+        )
+        if msg_id:
+            edit_message(cfg, chat_id, msg_id, text, menu(cfg, statuses=statuses))
+        else:
+            send(cfg, chat_id, text, menu(cfg, statuses=statuses))
+        return
     if data == "menu":
         PENDING_URL.pop(user_id, None)
         PENDING_ADD_TV.pop(user_id, None)
@@ -1943,8 +1975,7 @@ def main():
     # Skip commands accumulated while the bot was offline.
     old = telegram(cfg, "getUpdates", {"offset": -1, "timeout": 0})
     offset = old[-1]["update_id"] + 1 if old else None
-    if cfg["auto_refresh"]:
-        threading.Thread(target=refresh_loop, args=(cfg,), daemon=True).start()
+    threading.Thread(target=refresh_loop, args=(cfg,), daemon=True).start()
     if cfg["keep_awake"]:
         threading.Thread(target=keep_awake_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=schedule_loop, args=(cfg,), daemon=True).start()

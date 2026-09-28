@@ -56,6 +56,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(stored["tvs"][0]["id"], cfg["tvs"][0]["id"])
         self.assertEqual(os.stat(self.config).st_mode & 0o777, 0o600)
         self.assertEqual(cfg["healthcheck_interval_seconds"], 60)
+        self.assertFalse(cfg["auto_refresh"])
         self.assertTrue(cfg["keep_awake"])
         self.assertEqual(cfg["keep_awake_interval_seconds"], 60)
 
@@ -115,6 +116,7 @@ class CallbackTests(unittest.TestCase):
         self.cfg = {
             "telegram_token": "token",
             "allowed_user_ids": {123},
+            "auto_refresh": False,
             "tvs": [sample_tv()],
         }
 
@@ -159,6 +161,23 @@ class CallbackTests(unittest.TestCase):
         ):
             tv_bot.process(self.cfg, self.callback("off:tv000001"))
         self.assertEqual(order, ["ack", "operate"])
+
+    def test_auto_refresh_can_be_toggled_from_menu(self):
+        def enable(cfg, value):
+            cfg["auto_refresh"] = value
+
+        with (
+            mock.patch.object(tv_bot, "telegram"),
+            mock.patch.object(tv_bot, "set_auto_refresh", side_effect=enable) as setter,
+            mock.patch.object(tv_bot, "get_all_tv_statuses", return_value={}),
+            mock.patch.object(tv_bot, "edit_message") as edit,
+        ):
+            tv_bot.process(self.cfg, self.callback("toggle_auto_refresh"))
+        setter.assert_called_once_with(self.cfg, True)
+        self.assertTrue(self.cfg["auto_refresh"])
+        keyboard = edit.call_args.args[4]["inline_keyboard"]
+        self.assertTrue(any("Автообновление страниц: ВКЛ" in button["text"]
+                            for row in keyboard for button in row))
 
 
 class DispatcherTests(unittest.TestCase):
