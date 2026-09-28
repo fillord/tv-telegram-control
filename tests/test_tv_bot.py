@@ -59,6 +59,7 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(cfg["auto_refresh"])
         self.assertTrue(cfg["keep_awake"])
         self.assertEqual(cfg["keep_awake_interval_seconds"], 60)
+        self.assertEqual(cfg["wake_timeout_seconds"], 45)
 
     def test_duplicate_endpoint_is_rejected(self):
         cfg = tv_bot.load_config()
@@ -305,6 +306,27 @@ class DeviceSafetyTests(unittest.TestCase):
         self.assertIsNone(address)
         self.assertIn("недоступен по сети", error)
         self.assertNotIn("kill-server", [call.args[1] for call in adb.call_args_list])
+
+    def test_first_on_waits_until_adb_port_opens_after_wol(self):
+        tv = sample_tv()
+        tv["mac"] = "AA:BB:CC:DD:EE:FF"
+        with (
+            mock.patch.object(tv_bot, "wake_on_lan") as wol,
+            mock.patch.object(tv_bot, "is_device_reachable", side_effect=[False, False, True]) as reachable,
+            mock.patch.object(tv_bot.time, "sleep"),
+            mock.patch.object(tv_bot, "adb", side_effect=[(True, "connected"), (True, "device")]),
+        ):
+            address, error = tv_bot.connect({"wake_timeout_seconds": 45}, tv, wake=True)
+        self.assertEqual(address, "192.168.0.10:5555")
+        self.assertEqual(error, "")
+        wol.assert_called_once()
+        self.assertEqual(reachable.call_count, 3)
+
+    def test_intentional_standby_is_reported_as_sleep_when_port_is_closed(self):
+        tv = sample_tv()
+        tv["manual_sleep"] = True
+        with mock.patch.object(tv_bot, "is_device_reachable", return_value=False):
+            self.assertEqual(tv_bot.get_tv_status({}, tv), ("sleep", "Сон", "💤"))
 
     def test_keep_awake_applies_settings_and_wakes_sleeping_tv(self):
         tv = sample_tv()

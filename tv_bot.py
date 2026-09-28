@@ -125,6 +125,9 @@ def load_config():
     cfg["keep_awake_interval_seconds"] = max(
         30, int(cfg.get("keep_awake_interval_seconds", 60))
     )
+    cfg["wake_timeout_seconds"] = min(
+        120, max(5, int(cfg.get("wake_timeout_seconds", 45)))
+    )
     auto_refresh = cfg.get("auto_refresh", False)
     if not isinstance(auto_refresh, bool):
         raise ValueError("auto_refresh должен быть true или false без кавычек")
@@ -492,6 +495,19 @@ def wake_on_lan(mac, broadcast="255.255.255.255", tv_ip=None):
         raise OSError("Не удалось отправить Wake-on-LAN пакет")
 
 
+def wait_for_tv_port(tv, timeout):
+    """Wait for Android ADB after Wake-on-LAN instead of requiring a second click."""
+    port = int(tv.get("port", 5555))
+    deadline = time.monotonic() + timeout
+    while True:
+        if is_device_reachable(tv["ip"], port, timeout=1.0):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(2, remaining))
+
+
 def connect(cfg, tv, wake=False):
     port = int(tv.get("port", 5555))
     address = f'{tv["ip"]}:{port}'
@@ -500,11 +516,17 @@ def connect(cfg, tv, wake=False):
             wake_on_lan(tv["mac"], tv.get("broadcast", "255.255.255.255"), tv_ip=tv["ip"])
         except (ValueError, OSError) as exc:
             logging.warning("Wake-on-LAN для %s: %s", tv["name"], exc)
-        time.sleep(2)
 
     # Быстрая сокет-проверка, исключающая долгое 10-секундное зависание при выключенном ТВ
-    if not is_device_reachable(tv["ip"], port, timeout=1.0):
+    if wake and tv.get("mac"):
+        timeout = cfg.get("wake_timeout_seconds", 45)
+        reachable = wait_for_tv_port(tv, timeout)
+    else:
+        reachable = is_device_reachable(tv["ip"], port, timeout=1.0)
+    if not reachable:
         adb(cfg, "disconnect", address, timeout=2)
+        if wake and tv.get("mac"):
+            return None, f"ТВ не открыл порт {port} за {timeout} сек. после Wake-on-LAN"
         return None, f"ТВ недоступен по сети (порт {port} закрыт или ТВ выключен)"
 
     ok, output = adb(cfg, "connect", address, timeout=8)
@@ -662,6 +684,8 @@ def _get_tv_status_unlocked(cfg, tv):
     """
     port = int(tv.get("port", 5555))
     if not is_device_reachable(tv["ip"], port, timeout=0.8):
+        if tv.get("manual_sleep", False):
+            return "sleep", "Сон", "💤"
         return "offline", "Оффлайн", "🔴"
 
     address, error = connect(cfg, tv, wake=False)

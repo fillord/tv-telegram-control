@@ -61,6 +61,7 @@ chmod 600 data/config.json
   "auto_refresh": false,
   "keep_awake": true,
   "keep_awake_interval_seconds": 60,
+  "wake_timeout_seconds": 45,
   "timezone": "Asia/Almaty",
   "tvs": [
     {
