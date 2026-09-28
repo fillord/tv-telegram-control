@@ -1,0 +1,19 @@
+services:
+  tv-telegram-control:
+    build: .
+    container_name: tv-telegram-control
+    network_mode: host
+    user: "1000:1000"
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 15s
+    environment:
+      PYTHONUNBUFFERED: "1"
+      HOME: /app/home
+      TV_BOT_ADB_PATH: /usr/bin/adb
+      TV_BOT_CONFIG: /app/data/config.json
+      TV_BOT_LOG_DIR: /app/logs
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./adb:/app/home/.android

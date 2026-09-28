@@ -1,5 +1,7 @@
 # Credentials & Configuration
 config.json
+data/
+adb/
 *.json.tmp
 .env
 

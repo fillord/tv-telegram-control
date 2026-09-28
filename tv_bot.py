@@ -22,10 +22,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-CONFIG = ROOT / "config.json"
+CONFIG = Path(os.environ.get("TV_BOT_CONFIG", ROOT / "config.json")).expanduser()
 CONFIG_LOCK = threading.RLock()
 TV_LOCKS_LOCK = threading.Lock()
 TV_LOCKS = {}
+ADB_RECOVERY_LOCK = threading.Lock()
+ADB_LAST_RECOVERY = 0.0
+ADB_RECOVERY_COOLDOWN_SECONDS = 10.0
 PENDING_URL = {}
 PENDING_ADD_TV = {}
 KEY_ACTIONS = {
@@ -40,6 +43,13 @@ KEY_ACTIONS = {
     "back": ("4", "↩ Назад"),
     "home": ("3", "🏠 Домой"),
 }
+KEEP_AWAKE_COMMANDS = (
+    ("settings", "put", "global", "stay_on_while_plugged_in", "7"),
+    ("settings", "put", "system", "screen_off_timeout", "2147483647"),
+    ("settings", "put", "secure", "sleep_timeout", "-1"),
+    ("settings", "put", "secure", "screensaver_enabled", "0"),
+    ("svc", "power", "stayon", "true"),
+)
 
 
 def atomic_write_config(data):
@@ -108,11 +118,20 @@ def load_config():
     cfg["healthcheck_recovery_threshold"] = max(
         1, int(cfg.get("healthcheck_recovery_threshold", 2))
     )
+    cfg["keep_awake_interval_seconds"] = max(
+        30, int(cfg.get("keep_awake_interval_seconds", 60))
+    )
     auto_refresh = cfg.get("auto_refresh", True)
     if not isinstance(auto_refresh, bool):
         raise ValueError("auto_refresh должен быть true или false без кавычек")
     cfg["auto_refresh"] = auto_refresh
-    adb_path = Path(cfg.get("adb_path", "")).expanduser()
+    keep_awake = cfg.get("keep_awake", True)
+    if not isinstance(keep_awake, bool):
+        raise ValueError("keep_awake должен быть true или false без кавычек")
+    cfg["keep_awake"] = keep_awake
+    adb_path = Path(
+        os.environ.get("TV_BOT_ADB_PATH", cfg.get("adb_path", ""))
+    ).expanduser()
     if not adb_path.is_file() or not os.access(adb_path, os.X_OK):
         raise ValueError(f"ADB не найден или не исполняется: {adb_path}")
     cfg["adb_path"] = str(adb_path)
@@ -375,6 +394,37 @@ def is_device_reachable(ip, port=5555, timeout=1.0):
         return False
 
 
+def recover_adb_server(cfg):
+    """Restart a stuck local ADB server, at most once per cooldown window."""
+    global ADB_LAST_RECOVERY
+    with ADB_RECOVERY_LOCK:
+        now = time.monotonic()
+        if now - ADB_LAST_RECOVERY < ADB_RECOVERY_COOLDOWN_SECONDS:
+            return True
+        logging.warning("ADB-сервер завис: выполняется автоматический перезапуск")
+        adb(cfg, "kill-server", timeout=5)
+        ok, output = adb(cfg, "start-server", timeout=8)
+        if not ok:
+            logging.warning("Не удалось перезапустить ADB-сервер: %s", output)
+            return False
+        ADB_LAST_RECOVERY = time.monotonic()
+        return True
+
+
+def adb_connect_failed(output):
+    text = output.lower()
+    return any(
+        marker in text
+        for marker in (
+            "failed",
+            "unable",
+            "cannot connect",
+            "no route",
+            "timed out",
+        )
+    )
+
+
 def wake_on_lan(mac, broadcast="255.255.255.255", tv_ip=None):
     hex_mac = mac.replace(":", "").replace("-", "")
     if len(hex_mac) != 12:
@@ -414,10 +464,17 @@ def connect(cfg, tv, wake=False):
         return None, f"ТВ недоступен по сети (порт {port} закрыт или ТВ выключен)"
 
     ok, output = adb(cfg, "connect", address, timeout=8)
-    out_lower = output.lower()
-    if not ok or any(err in out_lower for err in ["failed", "unable", "cannot connect", "no route", "timed out"]):
+    if not ok or adb_connect_failed(output):
         adb(cfg, "disconnect", address, timeout=2)
-        return None, output or "Нет соединения по ADB"
+        # ADB can keep a stale route internally even though the TV port is open.
+        # Restart the local daemon once and retry instead of returning a false
+        # "No route to host" error to the user.
+        if is_device_reachable(tv["ip"], port, timeout=1.0):
+            recover_adb_server(cfg)
+            ok, output = adb(cfg, "connect", address, timeout=8)
+        if not ok or adb_connect_failed(output):
+            adb(cfg, "disconnect", address, timeout=2)
+            return None, output or "Нет соединения по ADB"
 
     ok, output = adb(cfg, "-s", address, "get-state", timeout=5)
     if not ok or output.strip() != "device":
@@ -429,6 +486,92 @@ def connect(cfg, tv, wake=False):
         return None, output or "ADB не авторизован на ТВ"
 
     return address, ""
+
+
+def apply_keep_awake_settings(cfg, address):
+    for command in KEEP_AWAKE_COMMANDS:
+        ok, output = adb(cfg, "-s", address, "shell", *command, timeout=6)
+        if not ok:
+            return False, output or f"Не выполнена команда: {' '.join(command)}"
+    return True, ""
+
+
+def _ensure_tv_awake_unlocked(cfg, tv):
+    port = int(tv.get("port", 5555))
+    if not is_device_reachable(tv["ip"], port, timeout=1.0) and tv.get("mac"):
+        try:
+            wake_on_lan(
+                tv["mac"],
+                tv.get("broadcast", "255.255.255.255"),
+                tv_ip=tv["ip"],
+            )
+            time.sleep(5)
+        except (ValueError, OSError) as exc:
+            return False, f"Wake-on-LAN: {exc}"
+
+    address, error = connect(cfg, tv, wake=False)
+    if not address:
+        return False, error
+
+    ok, error = apply_keep_awake_settings(cfg, address)
+    if not ok:
+        return False, error
+
+    ok, power = adb(cfg, "-s", address, "shell", "dumpsys", "power", timeout=5)
+    asleep = ok and any(
+        marker in power
+        for marker in (
+            "mWakefulness=Asleep",
+            "mWakefulness=Dozing",
+            "Display Power: state=OFF",
+        )
+    )
+    if asleep:
+        ok, output = adb(
+            cfg, "-s", address, "shell", "input", "keyevent", "224", timeout=6
+        )
+        if not ok:
+            return False, output or "Не удалось разбудить экран"
+        logging.info('Телевизор «%s» автоматически разбужен', tv["name"])
+    return True, ""
+
+
+def ensure_tv_awake(cfg, tv):
+    with get_tv_lock(tv):
+        # Re-read state after taking the lock: this loop may hold an older
+        # snapshot while the user explicitly sends the TV to standby.
+        with CONFIG_LOCK:
+            current_tv = next(
+                (item for item in cfg["tvs"] if item.get("id") == tv.get("id")),
+                tv,
+            )
+            current_tv = dict(current_tv)
+        if current_tv.get("manual_sleep", False):
+            return True, ""
+        return _ensure_tv_awake_unlocked(cfg, current_tv)
+
+
+def _keep_awake_loop_forever(cfg):
+    pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="keep_awake")
+    while True:
+        with CONFIG_LOCK:
+            televisions = [dict(tv) for tv in cfg["tvs"]]
+            interval = cfg["keep_awake_interval_seconds"]
+        if televisions:
+            results = list(pool.map(lambda tv: ensure_tv_awake(cfg, tv), televisions))
+            for tv, (ok, error) in zip(televisions, results):
+                if not ok:
+                    logging.warning('Контроль питания %s: %s', tv["name"], error)
+        time.sleep(interval)
+
+
+def keep_awake_loop(cfg):
+    while True:
+        try:
+            _keep_awake_loop_forever(cfg)
+        except Exception:
+            logging.exception("Контроль питания аварийно перезапускается")
+            time.sleep(10)
 
 
 def _get_tv_status_unlocked(cfg, tv):
@@ -507,6 +650,8 @@ def get_all_tv_statuses(cfg):
 def _operate_unlocked(cfg, tv, action, url_override=None):
     if action not in {"on", "off", "web", "both", "screen", "reboot"} and action not in KEY_ACTIONS:
         return "Неизвестная команда"
+    if action in {"on", "both"}:
+        set_manual_sleep(cfg, tv["id"], False)
     address, error = connect(cfg, tv, wake=action in {"on", "both"})
     if not address:
         return f"Не удалось связаться с ТВ: {error[:200]}"
@@ -520,17 +665,13 @@ def _operate_unlocked(cfg, tv, action, url_override=None):
             return f"Не удалось разбудить ТВ: {output[:200]}"
     if action == "off":
         ok, output = adb(cfg, "-s", address, "shell", "input", "keyevent", "223")
+        if ok:
+            set_manual_sleep(cfg, tv["id"], True)
         return "Отправлена команда ожидания" if ok else f"Ошибка: {output[:200]}"
     if action == "screen":
-        commands = [
-            ("settings", "put", "secure", "screensaver_enabled", "0"),
-            ("settings", "put", "system", "screen_off_timeout", "2147483647"),
-            ("svc", "power", "stayon", "true"),
-        ]
-        for command in commands:
-            ok, output = adb(cfg, "-s", address, "shell", *command)
-            if not ok:
-                return f"Не удалось применить настройки: {output[:200]}"
+        ok, output = apply_keep_awake_settings(cfg, address)
+        if not ok:
+            return f"Не удалось применить настройки: {output[:200]}"
         return "Заставка и автоматический сон отключены"
     if action == "reboot":
         ok, output = adb(cfg, "-s", address, "reboot")
@@ -751,7 +892,7 @@ def add_tv(cfg, name, ip, port=5555, url=None, mac=None):
             stored = json.load(file)
         if any(tv.get("ip") == ip and int(tv.get("port", 5555)) == port for tv in stored.get("tvs", [])):
             raise ValueError(f"Телевизор {ip}:{port} уже добавлен")
-        default_site = stored["tvs"][0]["url"] if stored.get("tvs") else "https://queue.omni-book.site/tv"
+        default_site = stored["tvs"][0]["url"] if stored.get("tvs") else "https://example.org/tv"
         new_tv = {
             "id": uuid.uuid4().hex[:12],
             "name": name,
@@ -783,6 +924,24 @@ def delete_tv(cfg, tv_id):
         atomic_write_config(stored)
         cfg["tvs"] = stored["tvs"]
         return deleted
+
+
+def set_manual_sleep(cfg, tv_id, enabled):
+    """Persist an explicit standby request so the watchdog respects it."""
+    with CONFIG_LOCK:
+        with CONFIG.open(encoding="utf-8") as file:
+            stored = json.load(file)
+        stored_tv = next(
+            (tv for tv in stored.get("tvs", []) if tv.get("id") == tv_id), None
+        )
+        if stored_tv is None:
+            raise ValueError("Телевизор не найден")
+        stored_tv["manual_sleep"] = bool(enabled)
+        atomic_write_config(stored)
+        for current_tv in cfg.get("tvs", []):
+            if current_tv.get("id") == tv_id:
+                current_tv["manual_sleep"] = bool(enabled)
+                break
 
 
 def refresh_url(url):
@@ -1156,7 +1315,7 @@ def process(cfg, update):
                     return
                 add_state["name"] = name
                 add_state["step"] = "url"
-                def_url = cfg["tvs"][0]["url"] if cfg.get("tvs") else "https://queue.omni-book.site/tv"
+                def_url = cfg["tvs"][0]["url"] if cfg.get("tvs") else "https://example.org/tv"
                 markup = {
                     "inline_keyboard": [
                         [{"text": f"✅ По умолчанию ({def_url[:28]}...)", "callback_data": "addtv:defurl"}],
@@ -1382,6 +1541,8 @@ def main():
     offset = old[-1]["update_id"] + 1 if old else None
     if cfg["auto_refresh"]:
         threading.Thread(target=refresh_loop, args=(cfg,), daemon=True).start()
+    if cfg["keep_awake"]:
+        threading.Thread(target=keep_awake_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=healthcheck_loop, args=(cfg,), daemon=True).start()
     logging.info("Бот работает. Для остановки нажмите Ctrl+C.")
     dispatcher = UpdateDispatcher(max_workers=10)

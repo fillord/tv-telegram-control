@@ -9,19 +9,21 @@
   "healthcheck_failure_threshold": 3,
   "healthcheck_recovery_threshold": 2,
   "auto_refresh": true,
+  "keep_awake": true,
+  "keep_awake_interval_seconds": 60,
   "tvs": [
     {
       "name": "TCL 43P635 — Телевизор 1",
       "ip": "192.168.0.108",
       "port": 5555,
-      "url": "https://queue.omni-book.site/tv",
+      "url": "https://example.org/tv",
       "mac": "AA:BB:CC:DD:EE:FF"
     },
     {
       "name": "Телевизор 2 (пример)",
       "ip": "192.168.0.109",
       "port": 5555,
-      "url": "https://queue.omni-book.site/tv"
+      "url": "https://example.org/tv"
     }
   ]
 }

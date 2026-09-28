@@ -1,0 +1,10 @@
+.git
+.agents
+.vscode
+__pycache__
+*.pyc
+logs
+adb
+data
+config.json
+tests

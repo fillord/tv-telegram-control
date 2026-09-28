@@ -55,6 +55,8 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(stored["tvs"][0]["id"], cfg["tvs"][0]["id"])
         self.assertEqual(os.stat(self.config).st_mode & 0o777, 0o600)
         self.assertEqual(cfg["healthcheck_interval_seconds"], 60)
+        self.assertTrue(cfg["keep_awake"])
+        self.assertEqual(cfg["keep_awake_interval_seconds"], 60)
 
     def test_duplicate_endpoint_is_rejected(self):
         cfg = tv_bot.load_config()
@@ -65,6 +67,11 @@ class ConfigTests(unittest.TestCase):
         cfg = tv_bot.load_config()
         with self.assertRaisesRegex(ValueError, "последний"):
             tv_bot.delete_tv(cfg, cfg["tvs"][0]["id"])
+
+    def test_adb_path_can_be_overridden_for_container(self):
+        with mock.patch.dict(os.environ, {"TV_BOT_ADB_PATH": "/bin/echo"}):
+            cfg = tv_bot.load_config()
+        self.assertEqual(cfg["adb_path"], "/bin/echo")
 
 
 class ParsingTests(unittest.TestCase):
@@ -173,6 +180,9 @@ class DispatcherTests(unittest.TestCase):
 
 
 class DeviceSafetyTests(unittest.TestCase):
+    def setUp(self):
+        tv_bot.ADB_LAST_RECOVERY = 0.0
+
     def test_unknown_power_state_is_not_treated_as_awake(self):
         tv = sample_tv()
         with (
@@ -214,6 +224,89 @@ class DeviceSafetyTests(unittest.TestCase):
             for thread in threads:
                 thread.join()
         self.assertEqual(maximum_active, 1)
+
+    def test_stuck_adb_server_is_restarted_and_connect_retried(self):
+        tv = sample_tv()
+        responses = iter([
+            (True, "failed to connect: No route to host"),
+            (True, "disconnected"),
+            (True, ""),
+            (True, "daemon started"),
+            (True, "connected"),
+            (True, "device"),
+        ])
+        with (
+            mock.patch.object(tv_bot, "is_device_reachable", return_value=True),
+            mock.patch.object(tv_bot, "adb", side_effect=lambda *_a, **_k: next(responses)) as adb,
+        ):
+            address, error = tv_bot.connect({}, tv)
+        self.assertEqual(address, "192.168.0.10:5555")
+        self.assertEqual(error, "")
+        commands = [call.args[1] for call in adb.call_args_list]
+        self.assertEqual(
+            commands,
+            ["connect", "disconnect", "kill-server", "start-server", "connect", "-s"],
+        )
+
+    def test_unreachable_tv_does_not_restart_adb_server(self):
+        tv = sample_tv()
+        with (
+            mock.patch.object(tv_bot, "is_device_reachable", return_value=False),
+            mock.patch.object(tv_bot, "adb", return_value=(True, "")) as adb,
+        ):
+            address, error = tv_bot.connect({}, tv)
+        self.assertIsNone(address)
+        self.assertIn("недоступен по сети", error)
+        self.assertNotIn("kill-server", [call.args[1] for call in adb.call_args_list])
+
+    def test_keep_awake_applies_settings_and_wakes_sleeping_tv(self):
+        tv = sample_tv()
+        adb_results = [
+            *((True, "") for _ in tv_bot.KEEP_AWAKE_COMMANDS),
+            (True, "mWakefulness=Asleep\nDisplay Power: state=OFF"),
+            (True, ""),
+        ]
+        with (
+            mock.patch.object(tv_bot, "is_device_reachable", return_value=True),
+            mock.patch.object(tv_bot, "connect", return_value=("192.168.0.10:5555", "")),
+            mock.patch.object(tv_bot, "adb", side_effect=adb_results) as adb,
+        ):
+            ok, error = tv_bot.ensure_tv_awake({"tvs": [tv]}, tv)
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+        self.assertEqual(adb.call_count, len(tv_bot.KEEP_AWAKE_COMMANDS) + 2)
+        self.assertEqual(adb.call_args_list[-1].args[-2:], ("keyevent", "224"))
+
+    def test_watchdog_skips_intentional_manual_sleep(self):
+        tv = sample_tv()
+        tv["manual_sleep"] = True
+        cfg = {"tvs": [tv]}
+        with mock.patch.object(tv_bot, "_ensure_tv_awake_unlocked") as ensure:
+            ok, error = tv_bot.ensure_tv_awake(cfg, dict(tv))
+        self.assertTrue(ok)
+        self.assertEqual(error, "")
+        ensure.assert_not_called()
+
+    def test_off_marks_manual_sleep_only_after_success(self):
+        tv = sample_tv()
+        with (
+            mock.patch.object(tv_bot, "connect", return_value=("192.168.0.10:5555", "")),
+            mock.patch.object(tv_bot, "adb", return_value=(True, "")),
+            mock.patch.object(tv_bot, "set_manual_sleep") as set_sleep,
+        ):
+            result = tv_bot._operate_unlocked({}, tv, "off")
+        self.assertEqual(result, "Отправлена команда ожидания")
+        set_sleep.assert_called_once_with({}, tv["id"], True)
+
+    def test_on_resumes_automatic_keep_awake(self):
+        tv = sample_tv()
+        with (
+            mock.patch.object(tv_bot, "set_manual_sleep") as set_sleep,
+            mock.patch.object(tv_bot, "connect", return_value=("192.168.0.10:5555", "")),
+            mock.patch.object(tv_bot, "adb", return_value=(True, "")),
+        ):
+            tv_bot._operate_unlocked({}, tv, "on")
+        set_sleep.assert_called_once_with({}, tv["id"], False)
 
 
 class MonitoringTests(unittest.TestCase):
