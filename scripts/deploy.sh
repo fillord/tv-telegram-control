@@ -10,10 +10,13 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
 ssh "${TARGET}" "mkdir -p '${REMOTE_DIR}/tests'"
 rsync -av \
+  .dockerignore \
+  .gitignore \
   Dockerfile \
   README.md \
   compose.yaml \
   config.example.json \
+  service.sh \
   tv_bot.py \
   "${TARGET}:${REMOTE_DIR}/"
 rsync -av tests/test_tv_bot.py "${TARGET}:${REMOTE_DIR}/tests/"
