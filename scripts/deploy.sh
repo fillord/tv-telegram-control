@@ -16,7 +16,6 @@ rsync -av \
   README.md \
   compose.yaml \
   config.example.json \
-  service.sh \
   tv_bot.py \
   "${TARGET}:${REMOTE_DIR}/"
 rsync -av tests/test_tv_bot.py "${TARGET}:${REMOTE_DIR}/tests/"
