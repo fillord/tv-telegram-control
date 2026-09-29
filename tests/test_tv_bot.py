@@ -60,6 +60,9 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(cfg["keep_awake"])
         self.assertEqual(cfg["keep_awake_interval_seconds"], 60)
         self.assertEqual(cfg["wake_timeout_seconds"], 45)
+        self.assertEqual(cfg["wake_verify_timeout_seconds"], 10)
+        self.assertEqual(cfg["schedule_retry_attempts"], 3)
+        self.assertEqual(cfg["schedule_retry_delay_seconds"], 60)
 
     def test_duplicate_endpoint_is_rejected(self):
         cfg = tv_bot.load_config()
@@ -278,6 +281,7 @@ class DeviceSafetyTests(unittest.TestCase):
         responses = iter([
             (True, "failed to connect: No route to host"),
             (True, "disconnected"),
+            (True, "failed to connect: No route to host"),
             (True, ""),
             (True, "daemon started"),
             (True, "connected"),
@@ -293,8 +297,26 @@ class DeviceSafetyTests(unittest.TestCase):
         commands = [call.args[1] for call in adb.call_args_list]
         self.assertEqual(
             commands,
-            ["connect", "disconnect", "kill-server", "start-server", "connect", "-s"],
+            ["connect", "disconnect", "connect", "kill-server", "start-server", "connect", "-s"],
         )
+
+    def test_device_reconnect_avoids_global_adb_restart(self):
+        tv = sample_tv()
+        responses = iter([
+            (True, "failed to connect: No route to host"),
+            (True, "disconnected"),
+            (True, "connected"),
+            (True, "device"),
+        ])
+        with (
+            mock.patch.object(tv_bot, "is_device_reachable", return_value=True),
+            mock.patch.object(tv_bot, "adb", side_effect=lambda *_a, **_k: next(responses)) as adb,
+            mock.patch.object(tv_bot, "recover_adb_server") as recover,
+        ):
+            address, error = tv_bot.connect({}, tv)
+        self.assertEqual((address, error), ("192.168.0.10:5555", ""))
+        recover.assert_not_called()
+        self.assertEqual([call.args[1] for call in adb.call_args_list], ["connect", "disconnect", "connect", "-s"])
 
     def test_unreachable_tv_does_not_restart_adb_server(self):
         tv = sample_tv()
@@ -390,6 +412,7 @@ class DeviceSafetyTests(unittest.TestCase):
             mock.patch.object(tv_bot, "wake_on_lan") as wol,
             mock.patch.object(tv_bot.time, "sleep"),
             mock.patch.object(tv_bot, "connect", return_value=("192.168.0.10:5555", "")),
+            mock.patch.object(tv_bot, "confirm_tv_awake", return_value=(True, "")),
         ):
             ok, output = tv_bot.wake_tv_with_retry(
                 {}, tv, "192.168.0.10:5555"
@@ -398,6 +421,19 @@ class DeviceSafetyTests(unittest.TestCase):
         self.assertEqual(output, "")
         wol.assert_called_once()
         self.assertEqual(adb.call_count, 3)
+
+    def test_wakeup_fails_when_screen_stays_asleep(self):
+        tv = sample_tv()
+        with (
+            mock.patch.object(tv_bot, "adb", return_value=(True, "")),
+            mock.patch.object(
+                tv_bot, "confirm_tv_awake",
+                return_value=(False, "Экран остался в режиме сна"),
+            ),
+        ):
+            ok, output = tv_bot.wake_tv_with_retry({}, tv, "192.168.0.10:5555")
+        self.assertFalse(ok)
+        self.assertIn("режиме сна", output)
 
 
 class MonitoringTests(unittest.TestCase):
@@ -408,6 +444,29 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(tv_bot.availability_transition(state, False, 3, 2), "down")
         self.assertIsNone(tv_bot.availability_transition(state, True, 3, 2))
         self.assertEqual(tv_bot.availability_transition(state, True, 3, 2), "up")
+
+    def test_repeated_warning_is_throttled_and_recovery_is_logged(self):
+        tv_bot.LOG_STATE.clear()
+        with (
+            mock.patch.object(tv_bot.time, "monotonic", side_effect=[0, 10]),
+            mock.patch.object(tv_bot.logging, "warning") as warning,
+            mock.patch.object(tv_bot.logging, "info") as info,
+        ):
+            tv_bot.log_throttled_warning("tv", "offline", repeat_seconds=60)
+            tv_bot.log_throttled_warning("tv", "offline", repeat_seconds=60)
+            tv_bot.log_recovery("tv", "online")
+        warning.assert_called_once()
+        info.assert_called_once_with("%s", "online")
+
+    def test_runtime_health_uses_recent_heartbeat(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            heartbeat = Path(tempdir) / "heartbeat"
+            with mock.patch.object(tv_bot, "HEARTBEAT", heartbeat):
+                tv_bot.update_heartbeat()
+                self.assertTrue(tv_bot.runtime_is_healthy(max_age_seconds=60))
+                old = time.time() - 120
+                os.utime(heartbeat, (old, old))
+                self.assertFalse(tv_bot.runtime_is_healthy(max_age_seconds=60))
 
 
 class ScheduleTests(unittest.TestCase):
@@ -476,6 +535,90 @@ class ScheduleTests(unittest.TestCase):
         ):
             tv_bot.run_due_schedules(cfg, monday)
         self.assertEqual(operate.call_args.args[2], "off")
+
+    def test_scheduled_off_accepts_existing_manual_sleep(self):
+        self.tv["manual_sleep"] = True
+        self.config.write_text(json.dumps(self.stored), encoding="utf-8")
+        cfg = dict(self.stored)
+        cfg["allowed_user_ids"] = {123}
+        monday = datetime(2026, 9, 28, 22, 0)
+        with (
+            mock.patch.object(tv_bot, "operate_many") as operate,
+            mock.patch.object(tv_bot, "notify_owners"),
+        ):
+            completed = tv_bot.run_due_schedules(cfg, monday)
+        operate.assert_not_called()
+        self.assertEqual(completed[0][2], "Режим ожидания уже установлен")
+        stored = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(stored["tvs"][0]["schedule"]["last_off"], "2026-09-28")
+
+    def test_missed_schedule_is_reconciled_after_startup(self):
+        cfg = dict(self.stored)
+        cfg["allowed_user_ids"] = {123}
+        cfg["schedule_retry_attempts"] = 3
+        cfg["schedule_retry_delay_seconds"] = 60
+        monday_late = datetime(2026, 9, 28, 10, 15)
+        with (
+            mock.patch.object(
+                tv_bot,
+                "operate_many",
+                return_value=[(self.tv, "Команда открытия сайта отправлена")],
+            ) as operate,
+            mock.patch.object(tv_bot, "notify_owners"),
+        ):
+            completed = tv_bot.run_due_schedules(cfg, monday_late)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(operate.call_args.args[2], "both")
+
+    def test_failed_schedule_retries_and_marks_only_success(self):
+        cfg = dict(self.stored)
+        cfg["allowed_user_ids"] = {123}
+        cfg["schedule_retry_attempts"] = 3
+        cfg["schedule_retry_delay_seconds"] = 60
+        first_at = datetime(2026, 9, 28, 9, 0)
+        second_at = datetime(2026, 9, 28, 9, 1)
+        with (
+            mock.patch.object(
+                tv_bot,
+                "operate_many",
+                side_effect=[
+                    [(self.tv, "Не удалось открыть сайт")],
+                    [(self.tv, "Команда открытия сайта отправлена")],
+                ],
+            ) as operate,
+            mock.patch.object(tv_bot, "notify_owners"),
+        ):
+            first = tv_bot.run_due_schedules(cfg, first_at)
+            stored_after_failure = json.loads(self.config.read_text(encoding="utf-8"))
+            second = tv_bot.run_due_schedules(cfg, second_at)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertEqual(operate.call_count, 2)
+        failed_schedule = stored_after_failure["tvs"][0]["schedule"]
+        self.assertNotIn("last_on", failed_schedule)
+        self.assertFalse(failed_schedule["last_on_success"])
+        final_schedule = json.loads(self.config.read_text(encoding="utf-8"))["tvs"][0]["schedule"]
+        self.assertEqual(final_schedule["last_on"], "2026-09-28")
+        self.assertTrue(final_schedule["last_on_success"])
+
+    def test_schedule_respects_retry_delay(self):
+        cfg = dict(self.stored)
+        cfg["allowed_user_ids"] = {123}
+        cfg["schedule_retry_attempts"] = 3
+        cfg["schedule_retry_delay_seconds"] = 60
+        now = datetime(2026, 9, 28, 9, 0)
+        with (
+            mock.patch.object(
+                tv_bot,
+                "operate_many",
+                return_value=[(self.tv, "Не удалось открыть сайт")],
+            ) as operate,
+            mock.patch.object(tv_bot, "notify_owners"),
+        ):
+            tv_bot.run_due_schedules(cfg, now)
+            immediate = tv_bot.run_due_schedules(cfg, now)
+        self.assertEqual(immediate, [])
+        self.assertEqual(operate.call_count, 1)
 
 
 if __name__ == "__main__":

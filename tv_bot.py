@@ -19,7 +19,7 @@ import urllib.request
 import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,7 +30,10 @@ TV_LOCKS_LOCK = threading.Lock()
 TV_LOCKS = {}
 ADB_RECOVERY_LOCK = threading.Lock()
 ADB_LAST_RECOVERY = 0.0
-ADB_RECOVERY_COOLDOWN_SECONDS = 10.0
+ADB_RECOVERY_COOLDOWN_SECONDS = 60.0
+LOG_STATE_LOCK = threading.Lock()
+LOG_STATE = {}
+HEARTBEAT = Path(os.environ.get("TV_BOT_HEARTBEAT", "/tmp/tv_bot_heartbeat"))
 PENDING_URL = {}
 PENDING_ADD_TV = {}
 PENDING_SCHEDULE = {}
@@ -96,6 +99,41 @@ def configure_logging():
     logging.basicConfig(level=logging.INFO, handlers=[handler, stream])
 
 
+def update_heartbeat():
+    """Record a successful Telegram polling cycle for Docker health checks."""
+    HEARTBEAT.touch()
+
+
+def runtime_is_healthy(max_age_seconds=120):
+    try:
+        return time.time() - HEARTBEAT.stat().st_mtime <= max_age_seconds
+    except OSError:
+        return False
+
+
+def log_throttled_warning(key, message, repeat_seconds=900):
+    """Log a repeated fault once, when it changes, or after the repeat window."""
+    now = time.monotonic()
+    with LOG_STATE_LOCK:
+        previous = LOG_STATE.get(key)
+        should_log = (
+            previous is None
+            or previous[0] != message
+            or now - previous[1] >= repeat_seconds
+        )
+        if should_log:
+            LOG_STATE[key] = (message, now)
+    if should_log:
+        logging.warning("%s", message)
+
+
+def log_recovery(key, message):
+    with LOG_STATE_LOCK:
+        previous = LOG_STATE.pop(key, None)
+    if previous is not None:
+        logging.info("%s", message)
+
+
 def load_config():
     with CONFIG_LOCK:
         with CONFIG.open(encoding="utf-8") as file:
@@ -127,6 +165,18 @@ def load_config():
     )
     cfg["wake_timeout_seconds"] = min(
         120, max(5, int(cfg.get("wake_timeout_seconds", 45)))
+    )
+    cfg["wake_verify_timeout_seconds"] = min(
+        30, max(0, int(cfg.get("wake_verify_timeout_seconds", 10)))
+    )
+    cfg["schedule_retry_attempts"] = min(
+        10, max(1, int(cfg.get("schedule_retry_attempts", 3)))
+    )
+    cfg["schedule_retry_delay_seconds"] = min(
+        3600, max(15, int(cfg.get("schedule_retry_delay_seconds", 60)))
+    )
+    cfg["log_repeat_interval_seconds"] = max(
+        60, int(cfg.get("log_repeat_interval_seconds", 900))
     )
     auto_refresh = cfg.get("auto_refresh", False)
     if not isinstance(auto_refresh, bool):
@@ -472,6 +522,33 @@ def adb_connect_failed(output):
     )
 
 
+def adb_requires_server_restart(output):
+    """Return true only for failures that can originate in the local ADB daemon."""
+    text = output.lower()
+    return any(
+        marker in text
+        for marker in (
+            "cannot connect to daemon",
+            "daemon not running",
+            "server version",
+            "protocol fault",
+            "no route to host",
+            "transport error",
+        )
+    )
+
+
+def adb_state_error(output):
+    text = output.lower()
+    if "unauthorized" in text:
+        return "ADB не авторизован на ТВ (подтвердите запрос на экране)"
+    if "offline" in text:
+        return "ТВ в режиме ADB offline (перезапустите сетевую отладку на ТВ)"
+    if "timeout" in text or "timed out" in text:
+        return "Истекло время ожидания ответа ADB"
+    return output or "ADB не авторизован на ТВ"
+
+
 def wake_on_lan(mac, broadcast="255.255.255.255", tv_ip=None):
     hex_mac = mac.replace(":", "").replace("-", "")
     if len(hex_mac) != 12:
@@ -532,10 +609,15 @@ def connect(cfg, tv, wake=False):
     ok, output = adb(cfg, "connect", address, timeout=8)
     if not ok or adb_connect_failed(output):
         adb(cfg, "disconnect", address, timeout=2)
-        # ADB can keep a stale route internally even though the TV port is open.
-        # Restart the local daemon once and retry instead of returning a false
-        # "No route to host" error to the user.
+        # First retry only this device. Restarting the shared ADB daemon affects
+        # every TV and is reserved for a repeated local-daemon failure.
         if is_device_reachable(tv["ip"], port, timeout=1.0):
+            ok, output = adb(cfg, "connect", address, timeout=8)
+        if (
+            (not ok or adb_connect_failed(output))
+            and adb_requires_server_restart(output)
+            and is_device_reachable(tv["ip"], port, timeout=1.0)
+        ):
             recover_adb_server(cfg)
             ok, output = adb(cfg, "connect", address, timeout=8)
         if not ok or adb_connect_failed(output):
@@ -545,11 +627,14 @@ def connect(cfg, tv, wake=False):
     ok, output = adb(cfg, "-s", address, "get-state", timeout=5)
     if not ok or output.strip() != "device":
         adb(cfg, "disconnect", address, timeout=2)
-        if "offline" in output.lower():
-            return None, "ТВ в режиме offline (перезагрузите отладку по ADB на ТВ)"
-        if "unauthorized" in output.lower():
-            return None, "ADB не авторизован на ТВ (подтвердите запрос на экране)"
-        return None, output or "ADB не авторизован на ТВ"
+        if "offline" in output.lower() and is_device_reachable(tv["ip"], port, timeout=1.0):
+            retry_ok, retry_output = adb(cfg, "connect", address, timeout=6)
+            if retry_ok and not adb_connect_failed(retry_output):
+                ok, output = adb(cfg, "-s", address, "get-state", timeout=5)
+                if ok and output.strip() == "device":
+                    return address, ""
+            adb(cfg, "disconnect", address, timeout=2)
+        return None, adb_state_error(output)
 
     return address, ""
 
@@ -562,13 +647,67 @@ def apply_keep_awake_settings(cfg, address):
     return True, ""
 
 
+def detect_power_state(power_output, window_output=""):
+    for line in power_output.splitlines():
+        line_str = line.strip()
+        if "mWakefulness=" in line_str:
+            value = line_str.split("mWakefulness=", 1)[1].split()[0].lower()
+            if value == "awake":
+                return "on"
+            if value in {"asleep", "dozing", "dreaming"}:
+                return "sleep"
+        if "Display Power: state=" in line_str:
+            value = line_str.split("Display Power: state=", 1)[1].split()[0].upper()
+            if value == "ON":
+                return "on"
+            if value == "OFF":
+                return "sleep"
+    if "mHoldingDisplaySuspendBlocker=true" in power_output:
+        return "on"
+    if "screenState=SCREEN_STATE_ON" in window_output or "mScreenOnEarly=true" in window_output:
+        return "on"
+    if "screenState=SCREEN_STATE_OFF" in window_output or "mScreenOnEarly=false" in window_output:
+        return "sleep"
+    return "unknown"
+
+
+def read_power_state(cfg, address):
+    ok, power = adb(cfg, "-s", address, "shell", "dumpsys", "power", timeout=4)
+    if not ok:
+        return "unknown"
+    state = detect_power_state(power)
+    if state != "unknown":
+        return state
+    ok, window = adb(
+        cfg, "-s", address, "shell", "dumpsys", "window", "policy", timeout=3
+    )
+    return detect_power_state(power, window if ok else "")
+
+
+def confirm_tv_awake(cfg, address):
+    timeout = cfg.get("wake_verify_timeout_seconds", 10)
+    deadline = time.monotonic() + timeout
+    while True:
+        state = read_power_state(cfg, address)
+        if state == "on":
+            return True, ""
+        if state == "unknown":
+            # Some Android TV builds do not expose a reliable power state.
+            # The accepted key event is still considered a successful command.
+            return True, "Состояние экрана не удалось подтвердить"
+        if time.monotonic() >= deadline:
+            return False, "Экран остался в режиме сна после команды пробуждения"
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
 def wake_tv_with_retry(cfg, tv, address):
     """Wake a TV and recover once from a stuck ADB shell command."""
     ok, output = adb(
         cfg, "-s", address, "shell", "input", "keyevent", "224", timeout=6
     )
     if ok:
-        return True, output
+        verified, detail = confirm_tv_awake(cfg, address)
+        return verified, detail or output
 
     adb(cfg, "disconnect", address, timeout=2)
     logging.warning(
@@ -593,7 +732,9 @@ def wake_tv_with_retry(cfg, tv, address):
     )
     if not ok:
         adb(cfg, "disconnect", retry_address, timeout=2)
-    return ok, retry_output
+        return False, retry_output
+    verified, detail = confirm_tv_awake(cfg, retry_address)
+    return verified, detail or retry_output
 
 
 def _ensure_tv_awake_unlocked(cfg, tv):
@@ -660,8 +801,15 @@ def _keep_awake_loop_forever(cfg):
         if televisions:
             results = list(pool.map(lambda tv: ensure_tv_awake(cfg, tv), televisions))
             for tv, (ok, error) in zip(televisions, results):
+                log_key = ("keep_awake", tv.get("id", tv["ip"]))
                 if not ok:
-                    logging.warning('Контроль питания %s: %s', tv["name"], error)
+                    log_throttled_warning(
+                        log_key,
+                        f'Контроль питания {tv["name"]}: {error}',
+                        cfg.get("log_repeat_interval_seconds", 900),
+                    )
+                else:
+                    log_recovery(log_key, f'Контроль питания {tv["name"]} восстановлен')
         time.sleep(interval)
 
 
@@ -697,33 +845,11 @@ def _get_tv_status_unlocked(cfg, tv):
             return "offline", "ADB оффлайн", "🔴"
         return "offline", "Оффлайн", "🔴"
 
-    # 1. Проверка dumpsys power (стандарт для Android TV)
-    ok, output = adb(cfg, "-s", address, "shell", "dumpsys", "power", timeout=4)
-    if ok and output:
-        for line in output.splitlines():
-            line_str = line.strip()
-            if "mWakefulness=" in line_str:
-                wake_val = line_str.split("mWakefulness=", 1)[1].split()[0].lower()
-                if wake_val == "awake":
-                    return "on", "Включен", "🟢"
-                if wake_val in {"asleep", "dozing", "dreaming"}:
-                    return "sleep", "Сон", "💤"
-            if "Display Power: state=" in line_str:
-                p_state = line_str.split("Display Power: state=", 1)[1].split()[0].upper()
-                if p_state == "ON":
-                    return "on", "Включен", "🟢"
-                if p_state == "OFF":
-                    return "sleep", "Сон", "💤"
-        if "mHoldingDisplaySuspendBlocker=true" in output:
-            return "on", "Включен", "🟢"
-
-    # 2. Резервная проверка через dumpsys window
-    ok, win_out = adb(cfg, "-s", address, "shell", "dumpsys", "window", "policy", timeout=3)
-    if ok and win_out:
-        if "screenState=SCREEN_STATE_ON" in win_out or "mScreenOnEarly=true" in win_out:
-            return "on", "Включен", "🟢"
-        if "screenState=SCREEN_STATE_OFF" in win_out or "mScreenOnEarly=false" in win_out:
-            return "sleep", "Сон", "💤"
+    state = read_power_state(cfg, address)
+    if state == "on":
+        return "on", "Включен", "🟢"
+    if state == "sleep":
+        return "sleep", "Сон", "💤"
 
     return "unknown", "Состояние неизвестно", "⚪"
 
@@ -962,9 +1088,21 @@ def normalize_schedule(schedule):
         raise ValueError("Дни расписания должны быть числами от 0 до 6")
     if normalized["on"] == normalized["off"]:
         raise ValueError("Время включения и ожидания не должно совпадать")
-    for key in ("last_on", "last_off"):
+    for key in (
+        "last_on", "last_off",
+        "last_on_event", "last_off_event",
+        "last_on_attempt_event", "last_off_attempt_event",
+        "last_on_attempt_at", "last_off_attempt_at",
+        "last_on_result", "last_off_result",
+    ):
         if schedule.get(key):
             normalized[key] = str(schedule[key])
+    for key in ("last_on_attempts", "last_off_attempts"):
+        if schedule.get(key) is not None:
+            normalized[key] = max(0, int(schedule[key]))
+    for key in ("last_on_success", "last_off_success"):
+        if schedule.get(key) is not None:
+            normalized[key] = bool(schedule[key])
     return normalized
 
 
@@ -1243,14 +1381,90 @@ def notify_owners(cfg, message):
             logging.warning("Не удалось отправить уведомление %s: %s", user_id, exc)
 
 
-def mark_schedule_run(cfg, tv_ids, action, date_key):
-    field = f"last_{action}"
+def schedule_event_key(action, event_at):
+    return f'{event_at.strftime("%Y-%m-%dT%H:%M")}:{action}'
+
+
+def most_recent_schedule_event(schedule, now):
+    """Return the latest desired on/off state, including missed events."""
+    events = []
+    days = set(schedule.get("days", []))
+    for offset in range(8):
+        day = now - timedelta(days=offset)
+        if day.weekday() not in days:
+            continue
+        for action in ("on", "off"):
+            hour, minute = map(int, schedule[action].split(":"))
+            event_at = now.replace(
+                year=day.year,
+                month=day.month,
+                day=day.day,
+                hour=hour,
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+            if event_at <= now:
+                events.append((event_at, action))
+    if not events:
+        return None
+    event_at, action = max(events, key=lambda item: item[0])
+    return action, event_at
+
+
+def schedule_retry_ready(cfg, schedule, action, event_at, now):
+    event_key = schedule_event_key(action, event_at)
+    success_event = schedule.get(f"last_{action}_event")
+    legacy_success = schedule.get(f"last_{action}") == event_at.strftime("%Y-%m-%d")
+    if success_event == event_key or (not success_event and legacy_success):
+        return False
+
+    attempt_event = schedule.get(f"last_{action}_attempt_event")
+    attempts = int(schedule.get(f"last_{action}_attempts", 0)) if attempt_event == event_key else 0
+    if attempts >= cfg.get("schedule_retry_attempts", 3):
+        return False
+
+    if attempt_event == event_key and schedule.get(f"last_{action}_attempt_at"):
+        try:
+            attempted_at = datetime.fromisoformat(schedule[f"last_{action}_attempt_at"])
+            if attempted_at.tzinfo is None:
+                attempted_at = attempted_at.replace(tzinfo=now.tzinfo)
+            elapsed = (now - attempted_at.astimezone(now.tzinfo)).total_seconds()
+            if elapsed < cfg.get("schedule_retry_delay_seconds", 60):
+                return False
+        except (TypeError, ValueError):
+            pass
+    return True
+
+
+def operation_succeeded(result):
+    return not result.startswith(("Не удалось", "Ошибка"))
+
+
+def record_schedule_attempts(cfg, action, events, results, attempted_at):
+    result_by_id = {tv["id"]: result for tv, result in results}
     with CONFIG_LOCK:
         with CONFIG.open(encoding="utf-8") as file:
             stored = json.load(file)
         for tv in stored.get("tvs", []):
-            if tv.get("id") in tv_ids and isinstance(tv.get("schedule"), dict):
-                tv["schedule"][field] = date_key
+            tv_id = tv.get("id")
+            if tv_id not in events or not isinstance(tv.get("schedule"), dict):
+                continue
+            event_at = events[tv_id]
+            event_key = schedule_event_key(action, event_at)
+            schedule = tv["schedule"]
+            previous_event = schedule.get(f"last_{action}_attempt_event")
+            attempts = int(schedule.get(f"last_{action}_attempts", 0)) if previous_event == event_key else 0
+            result = result_by_id.get(tv_id, "Ошибка: результат операции отсутствует")
+            success = operation_succeeded(result)
+            schedule[f"last_{action}_attempt_event"] = event_key
+            schedule[f"last_{action}_attempt_at"] = attempted_at.isoformat(timespec="seconds")
+            schedule[f"last_{action}_attempts"] = attempts + 1
+            schedule[f"last_{action}_result"] = result[:500]
+            schedule[f"last_{action}_success"] = success
+            if success:
+                schedule[f"last_{action}"] = event_at.strftime("%Y-%m-%d")
+                schedule[f"last_{action}_event"] = event_key
         atomic_write_config(stored)
         cfg["tvs"] = stored["tvs"]
 
@@ -1263,34 +1477,63 @@ def run_due_schedules(cfg, now=None):
         now = now.replace(tzinfo=timezone)
     else:
         now = now.astimezone(timezone)
-    minute = now.strftime("%H:%M")
-    date_key = now.strftime("%Y-%m-%d")
-    weekday = now.weekday()
     with CONFIG_LOCK:
         televisions = [dict(tv) for tv in cfg.get("tvs", [])]
 
     completed = []
+    due_by_action = {"on": [], "off": []}
+    events_by_action = {"on": {}, "off": {}}
+    already_satisfied = []
+    satisfied_events = {}
+    for tv in televisions:
+        schedule = tv.get("schedule")
+        if not isinstance(schedule, dict) or not schedule.get("enabled", False):
+            continue
+        event = most_recent_schedule_event(schedule, now)
+        if event is None:
+            continue
+        schedule_action, event_at = event
+        if schedule_retry_ready(cfg, schedule, schedule_action, event_at, now):
+            if schedule_action == "off" and tv.get("manual_sleep", False):
+                already_satisfied.append((tv, "Режим ожидания уже установлен"))
+                satisfied_events[tv["id"]] = event_at
+                continue
+            due_by_action[schedule_action].append(tv)
+            events_by_action[schedule_action][tv["id"]] = event_at
+
+    if already_satisfied:
+        record_schedule_attempts(cfg, "off", satisfied_events, already_satisfied, now)
+        completed.extend(("off", tv, result) for tv, result in already_satisfied)
+
     for schedule_action, tv_action in (("on", "both"), ("off", "off")):
-        due = []
-        for tv in televisions:
-            schedule = tv.get("schedule")
-            if not isinstance(schedule, dict) or not schedule.get("enabled", False):
-                continue
-            if weekday not in schedule.get("days", []) or schedule.get(schedule_action) != minute:
-                continue
-            if schedule.get(f"last_{schedule_action}") == date_key:
-                continue
-            due.append(tv)
+        due = due_by_action[schedule_action]
         if not due:
             continue
         results = operate_many(cfg, due, tv_action)
-        mark_schedule_run(cfg, {tv["id"] for tv in due}, schedule_action, date_key)
+        record_schedule_attempts(
+            cfg, schedule_action, events_by_action[schedule_action], results, now
+        )
         completed.extend((schedule_action, tv, result) for tv, result in results)
         label = "включение + сайт" if schedule_action == "on" else "ожидание"
+        attempts_limit = cfg.get("schedule_retry_attempts", 3)
+        current_by_id = {tv["id"]: tv for tv in cfg.get("tvs", [])}
+        lines = []
+        for tv, result in results:
+            if operation_succeeded(result):
+                status = "✅"
+            else:
+                schedule = current_by_id.get(tv["id"], {}).get("schedule", {})
+                attempts = int(schedule.get(f"last_{schedule_action}_attempts", 1))
+                status = (
+                    f"❌ попытки исчерпаны ({attempts}/{attempts_limit})"
+                    if attempts >= attempts_limit
+                    else f"❌ будет повтор ({attempts}/{attempts_limit})"
+                )
+            lines.append(f"{tv['name']}: {result} ({status})")
         notify_owners(
             cfg,
             "🕒 Расписание: " + label + "\n" +
-            "\n".join(f"{tv['name']}: {result}" for tv, result in results),
+            "\n".join(lines),
         )
     return completed
 
@@ -1330,12 +1573,19 @@ def _refresh_loop_forever(cfg):
                 }
                 for job in as_completed(jobs):
                     tv = jobs[job]
+                    log_key = ("refresh", tv.get("id", tv["ip"]))
                     try:
                         result = job.result()
                     except Exception as exc:
                         result = f"Ошибка: {exc}"
                     if result.startswith("Не удалось") or result.startswith("Ошибка"):
-                        logging.warning('Автообновление %s: %s', tv["name"], result)
+                        log_throttled_warning(
+                            log_key,
+                            f'Автообновление {tv["name"]}: {result}',
+                            cfg.get("log_repeat_interval_seconds", 900),
+                        )
+                    else:
+                        log_recovery(log_key, f'Автообновление {tv["name"]} восстановлено')
         time.sleep(interval)
 
 
@@ -2032,13 +2282,34 @@ class UpdateDispatcher:
         self._pool.shutdown(wait=wait)
 
 
+def telegram_retry_delay(failures):
+    return min(60, 3 * (2 ** min(max(failures - 1, 0), 5)))
+
+
+def get_initial_update_offset(cfg):
+    failures = 0
+    while True:
+        try:
+            old = telegram(cfg, "getUpdates", {"offset": -1, "timeout": 0})
+            update_heartbeat()
+            log_recovery("telegram_polling", "Соединение с Telegram восстановлено")
+            return old[-1]["update_id"] + 1 if old else None
+        except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
+            failures += 1
+            log_throttled_warning(
+                "telegram_polling",
+                f"Ошибка начального соединения с Telegram: {exc}",
+                cfg.get("log_repeat_interval_seconds", 900),
+            )
+            time.sleep(telegram_retry_delay(failures))
+
+
 def main():
     configure_logging()
     cfg = load_config()
     set_bot_commands(cfg)
     # Skip commands accumulated while the bot was offline.
-    old = telegram(cfg, "getUpdates", {"offset": -1, "timeout": 0})
-    offset = old[-1]["update_id"] + 1 if old else None
+    offset = get_initial_update_offset(cfg)
     threading.Thread(target=refresh_loop, args=(cfg,), daemon=True).start()
     if cfg["keep_awake"]:
         threading.Thread(target=keep_awake_loop, args=(cfg,), daemon=True).start()
@@ -2046,23 +2317,47 @@ def main():
     threading.Thread(target=healthcheck_loop, args=(cfg,), daemon=True).start()
     logging.info("Бот работает. Для остановки нажмите Ctrl+C.")
     dispatcher = UpdateDispatcher(max_workers=10)
+    connection_failures = 0
     while True:
         try:
             payload = {"timeout": 25, "allowed_updates": ["message", "callback_query"]}
             if offset is not None:
                 payload["offset"] = offset
             updates = telegram(cfg, "getUpdates", payload)
+            update_heartbeat()
+            connection_failures = 0
+            log_recovery("telegram_polling", "Соединение с Telegram восстановлено")
             for update in updates:
                 dispatcher.submit(cfg, update)
                 offset = update["update_id"] + 1
         except (urllib.error.URLError, TimeoutError, RuntimeError) as exc:
-            logging.warning("Ошибка соединения: %s", exc)
-            time.sleep(3)
+            connection_failures += 1
+            log_throttled_warning(
+                "telegram_polling",
+                f"Ошибка соединения с Telegram: {exc}",
+                cfg.get("log_repeat_interval_seconds", 900),
+            )
+            time.sleep(telegram_retry_delay(connection_failures))
+
+
+def print_config_summary(cfg):
+    print("Конфигурация корректна")
+    print(f"Телевизоров: {len(cfg.get('tvs', []))}")
+    print(f"Разрешённых пользователей: {len(cfg.get('allowed_user_ids', []))}")
+    print(f"Часовой пояс: {cfg.get('timezone')}")
+    print(f"ADB: {cfg.get('adb_path')}")
 
 
 if __name__ == "__main__":
     try:
-        main()
+        if sys.argv[1:] == ["--healthcheck"]:
+            raise SystemExit(0 if runtime_is_healthy() else 1)
+        if sys.argv[1:] == ["--check-config"]:
+            print_config_summary(load_config())
+        elif sys.argv[1:]:
+            raise SystemExit("Использование: tv_bot.py [--check-config|--healthcheck]")
+        else:
+            main()
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         sys.exit(f"Ошибка настройки: {exc}")
     except KeyboardInterrupt:

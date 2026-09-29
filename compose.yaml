@@ -13,6 +13,8 @@ services:
       TV_BOT_ADB_PATH: /usr/bin/adb
       TV_BOT_CONFIG: /app/data/config.json
       TV_BOT_LOG_DIR: /app/logs
+      TV_BOT_HEARTBEAT: /tmp/tv_bot_heartbeat
+      TZ: Asia/Almaty
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

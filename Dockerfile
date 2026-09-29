@@ -8,4 +8,7 @@ WORKDIR /app
 
 COPY tv_bot.py /app/tv_bot.py
 
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+    CMD ["python3", "/app/tv_bot.py", "--healthcheck"]
+
 CMD ["python3", "/app/tv_bot.py"]

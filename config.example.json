@@ -12,6 +12,10 @@
   "keep_awake": true,
   "keep_awake_interval_seconds": 60,
   "wake_timeout_seconds": 45,
+  "wake_verify_timeout_seconds": 10,
+  "schedule_retry_attempts": 3,
+  "schedule_retry_delay_seconds": 60,
+  "log_repeat_interval_seconds": 900,
   "timezone": "Asia/Almaty",
   "tvs": [
     {
