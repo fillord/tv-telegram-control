@@ -117,6 +117,7 @@ class CallbackTests(unittest.TestCase):
     def setUp(self):
         tv_bot.PENDING_URL.clear()
         tv_bot.PENDING_ADD_TV.clear()
+        tv_bot.PENDING_SCHEDULE.clear()
         self.cfg = {
             "telegram_token": "token",
             "allowed_user_ids": {123},
@@ -161,6 +162,8 @@ class CallbackTests(unittest.TestCase):
         with (
             mock.patch.object(tv_bot, "telegram", side_effect=telegram),
             mock.patch.object(tv_bot, "send"),
+            mock.patch.object(tv_bot, "edit_message"),
+            mock.patch.object(tv_bot, "get_tv_status", return_value=("sleep", "Сон", "💤")),
             mock.patch.object(tv_bot, "operate_many", side_effect=operate),
         ):
             tv_bot.process(self.cfg, self.callback("off:tv000001"))
@@ -196,8 +199,69 @@ class CallbackTests(unittest.TestCase):
             tv_bot.process(self.cfg, self.callback("tvrefresh:tv000001"))
         setter.assert_called_once_with(self.cfg, "tv000001", True)
         keyboard = edit.call_args.args[4]["inline_keyboard"]
-        self.assertTrue(any("Автообновление этого ТВ: ВКЛ" in button["text"]
+        self.assertTrue(any("Автообновление: ВКЛ" in button["text"]
                             for row in keyboard for button in row))
+
+    def test_remote_opens_compact_submenu_without_device_operation(self):
+        with (
+            mock.patch.object(tv_bot, "telegram"),
+            mock.patch.object(tv_bot, "edit_message") as edit,
+            mock.patch.object(tv_bot, "operate_many") as operate,
+        ):
+            tv_bot.process(self.cfg, self.callback("remote:tv000001"))
+        operate.assert_not_called()
+        self.assertIn("Пульт", edit.call_args.args[3])
+        callbacks = [
+            button["callback_data"]
+            for row in edit.call_args.args[4]["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn("up:tv000001", callbacks)
+        self.assertIn("select:tv000001", callbacks)
+
+    def test_remote_key_acknowledges_with_popup_text(self):
+        with (
+            mock.patch.object(tv_bot, "telegram") as telegram,
+            mock.patch.object(
+                tv_bot, "operate_many",
+                return_value=[(self.cfg["tvs"][0], "⬆️ Вверх выполнено")],
+            ),
+        ):
+            tv_bot.process(self.cfg, self.callback("up:tv000001"))
+        payload = telegram.call_args_list[0].args[2]
+        self.assertEqual(payload["text"], "⬆️ Вверх")
+
+
+class InterfaceTests(unittest.TestCase):
+    def setUp(self):
+        self.tv = sample_tv()
+        self.cfg = {"auto_refresh": False, "tvs": [self.tv]}
+
+    def test_main_menu_uses_short_tv_labels_and_summary(self):
+        statuses = {self.tv["id"]: ("on", "Включен", "🟢")}
+        keyboard = tv_bot.menu(self.cfg, statuses=statuses)["inline_keyboard"]
+        self.assertEqual(keyboard[0][0]["text"], "🟢 Зал")
+        self.assertNotIn("(Включен)", keyboard[0][0]["text"])
+        self.assertIn("🟢 1", tv_bot.main_screen_text(statuses))
+
+    def test_tv_actions_are_split_into_submenus(self):
+        keyboard = tv_bot.actions(self.cfg, self.tv["id"], self.tv)["inline_keyboard"]
+        callbacks = [button["callback_data"] for row in keyboard for button in row]
+        self.assertIn("remote:tv000001", callbacks)
+        self.assertIn("sound:tv000001", callbacks)
+        self.assertIn("settings:tv000001", callbacks)
+        self.assertNotIn("up:tv000001", callbacks)
+        self.assertNotIn("volup:tv000001", callbacks)
+
+    def test_unchanged_screen_does_not_create_duplicate_message(self):
+        with (
+            mock.patch.object(
+                tv_bot, "telegram", side_effect=RuntimeError("message is not modified")
+            ),
+            mock.patch.object(tv_bot, "send") as send,
+        ):
+            tv_bot.edit_message({}, 123, 5, "same")
+        send.assert_not_called()
 
 
 class DispatcherTests(unittest.TestCase):

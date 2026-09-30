@@ -268,6 +268,10 @@ def edit_message(cfg, chat_id, message_id, message, markup=None):
         payload["reply_markup"] = markup
     try:
         telegram(cfg, "editMessageText", payload)
+    except RuntimeError as exc:
+        if "message is not modified" in str(exc).lower():
+            return
+        send(cfg, chat_id, message, markup=markup)
     except Exception:
         send(cfg, chat_id, message, markup=markup)
 
@@ -361,21 +365,63 @@ def menu(cfg, statuses=None):
         statuses = get_all_tv_statuses(cfg)
     rows = []
     for tv in cfg["tvs"]:
-        code, label, icon = statuses.get(tv["id"], ("offline", "...", "⚪"))
-        rows.append([{"text": f"{icon} {tv['name']} ({label})", "callback_data": f"select:{tv['id']}"}])
+        _, _, icon = statuses.get(tv["id"], ("offline", "...", "⚪"))
+        rows.append([{"text": f"{icon} {tv['name']}", "callback_data": f"select:{tv['id']}"}])
     if len(cfg["tvs"]) > 1:
-        rows.append([{"text": "📺 Все телевизоры", "callback_data": "select:all"}])
+        rows.append([
+            {"text": "🔄 Обновить", "callback_data": "refresh_menu"},
+            {"text": "⚡ Управлять всеми", "callback_data": "select:all"},
+        ])
+    else:
+        rows.append([{"text": "🔄 Обновить", "callback_data": "refresh_menu"}])
     rows.append([
-        {"text": "➕ Добавить ТВ", "callback_data": "addtv_start"},
-        {"text": "🔄 Обновить статусы", "callback_data": "refresh_menu"}
+        {"text": "🕒 Расписание", "callback_data": "schedule_menu"},
+        {"text": "＋ Добавить ТВ", "callback_data": "addtv_start"},
     ])
-    rows.append([{"text": "🕒 Расписание", "callback_data": "schedule_menu"}])
-    auto_refresh_label = "ВКЛ" if cfg.get("auto_refresh", False) else "ВЫКЛ"
-    rows.append([{
-        "text": f"🔁 Автообновление страниц: {auto_refresh_label}",
-        "callback_data": "toggle_auto_refresh",
-    }])
+    rows.append([{"text": "⚙️ Общие настройки", "callback_data": "global_settings"}])
     return {"inline_keyboard": rows}
+
+
+def main_screen_text(statuses, notice=None):
+    counts = {"on": 0, "sleep": 0, "offline": 0, "unauthorized": 0, "unknown": 0}
+    for code, _, _ in statuses.values():
+        counts[code] = counts.get(code, 0) + 1
+    summary = [
+        f"🟢 {counts['on']}",
+        f"💤 {counts['sleep']}",
+        f"🔴 {counts['offline']}",
+    ]
+    if counts["unauthorized"]:
+        summary.append(f"🟡 {counts['unauthorized']}")
+    if counts["unknown"]:
+        summary.append(f"⚪ {counts['unknown']}")
+    lines = ["📺 Телевизоры", " · ".join(summary), f"Обновлено: {time.strftime('%H:%M')}"]
+    if notice:
+        lines.extend(("", notice))
+    return "\n".join(lines)
+
+
+def tv_screen_text(tv, status, notice=None):
+    _, label, icon = status
+    host = urllib.parse.urlsplit(tv.get("url", "")).hostname or "не задан"
+    lines = [
+        f"📺 {tv['name']}",
+        "",
+        f"{icon} {label}",
+        f"🌐 {host}",
+        f"🕒 {format_schedule(tv.get('schedule'))}",
+    ]
+    if notice:
+        lines.extend(("", notice))
+    return "\n".join(lines)
+
+
+def target_screen_text(tvs, title, notice=None):
+    name = "Все телевизоры" if len(tvs) > 1 else tvs[0]["name"]
+    lines = [f"{title} — {name}"]
+    if notice:
+        lines.extend(("", notice))
+    return "\n".join(lines)
 
 
 def screenshot_menu(cfg, statuses=None):
@@ -394,47 +440,103 @@ def screenshot_menu(cfg, statuses=None):
 def actions(cfg, target, tv=None):
     rows = [
         [{"text": "▶ Включить", "callback_data": f"on:{target}"},
-         {"text": "⏸ Ожидание", "callback_data": f"off:{target}"}],
-        [{"text": "🌐 Открыть сайт", "callback_data": f"web:{target}"},
-         {"text": "▶🌐 Включить + сайт", "callback_data": f"both:{target}"}],
-        [{"text": "🖥 Не засыпать", "callback_data": f"screen:{target}"},
-         {"text": "🔄 Перезагрузить", "callback_data": f"rebootask:{target}"}],
+         {"text": "⏸ Сон", "callback_data": f"off:{target}"}],
+        [{"text": "▶🌐 Включить и открыть", "callback_data": f"both:{target}"}],
+        [{"text": "🌐 Открыть страницу", "callback_data": f"web:{target}"}],
+        [{"text": "🎮 Пульт", "callback_data": f"remote:{target}"},
+         {"text": "🔊 Звук", "callback_data": f"sound:{target}"}],
         [{"text": "📸 Скриншот", "callback_data": f"screenshot:{target}"},
-         {"text": "🔗 Сменить сайт", "callback_data": f"seturl:{target}"}],
-        [{"text": "🕒 Расписание", "callback_data": f"schedule:{target}"}],
-        [{"text": "🔉 Тише", "callback_data": f"voldown:{target}"},
-         {"text": "🔇 Mute", "callback_data": f"mute:{target}"},
-         {"text": "🔊 Громче", "callback_data": f"volup:{target}"}],
-        [{"text": "⬆️", "callback_data": f"up:{target}"}],
-        [{"text": "⬅️", "callback_data": f"left:{target}"},
-         {"text": "🔘 OK", "callback_data": f"enter:{target}"},
-         {"text": "➡️", "callback_data": f"right:{target}"}],
-        [{"text": "⬇️", "callback_data": f"down:{target}"}],
+         {"text": "🕒 Расписание", "callback_data": f"schedule:{target}"}],
+        [{"text": "⚙️ Настройки", "callback_data": f"settings:{target}"}],
+        [{"text": "‹ К телевизорам", "callback_data": "menu"}],
+    ]
+    return {"inline_keyboard": rows}
+
+
+def remote_controls(target):
+    return {"inline_keyboard": [
+        [{"text": "▲", "callback_data": f"up:{target}"}],
+        [{"text": "◀", "callback_data": f"left:{target}"},
+         {"text": "OK", "callback_data": f"enter:{target}"},
+         {"text": "▶", "callback_data": f"right:{target}"}],
+        [{"text": "▼", "callback_data": f"down:{target}"}],
         [{"text": "↩ Назад", "callback_data": f"back:{target}"},
-         {"text": "🏠 Домой", "callback_data": f"home:{target}"}],
+         {"text": "⌂ Домой", "callback_data": f"home:{target}"}],
+        [{"text": "‹ К управлению", "callback_data": f"select:{target}"}],
+    ]}
+
+
+def sound_controls(target):
+    return {"inline_keyboard": [
+        [{"text": "− Тише", "callback_data": f"voldown:{target}"},
+         {"text": "Mute", "callback_data": f"mute:{target}"},
+         {"text": "+ Громче", "callback_data": f"volup:{target}"}],
+        [{"text": "‹ К управлению", "callback_data": f"select:{target}"}],
+    ]}
+
+
+def settings_controls(cfg, target, tv=None):
+    rows = [
+        [{"text": "🖥 Не засыпать", "callback_data": f"screen:{target}"}],
+        [{"text": "🔗 Изменить сайт", "callback_data": f"seturl:{target}"}],
+        [{"text": "🔄 Перезагрузить", "callback_data": f"rebootask:{target}"}],
     ]
     if target != "all":
         refresh_enabled = tv.get("auto_refresh", cfg.get("auto_refresh", False)) if tv else False
-        rows.append([{
-            "text": f"🔁 Автообновление этого ТВ: {'ВКЛ' if refresh_enabled else 'ВЫКЛ'}",
+        rows.insert(0, [{
+            "text": f"🔁 Автообновление: {'ВКЛ' if refresh_enabled else 'ВЫКЛ'}",
             "callback_data": f"tvrefresh:{target}",
         }])
-        rows.append([{"text": "🗑 Удалить этот ТВ", "callback_data": f"deleteask:{target}"}])
-    rows.append([{"text": "↩ Выбрать ТВ", "callback_data": "menu"}])
+        rows.append([{"text": "ℹ️ Информация", "callback_data": f"info:{target}"}])
+        rows.append([{"text": "🗑 Удалить телевизор", "callback_data": f"deleteask:{target}"}])
+    rows.append([{"text": "‹ К управлению", "callback_data": f"select:{target}"}])
     return {"inline_keyboard": rows}
+
+
+def global_settings(cfg):
+    enabled = "ВКЛ" if cfg.get("auto_refresh", False) else "ВЫКЛ"
+    return {"inline_keyboard": [
+        [{"text": f"🔁 Автообновление страниц: {enabled}", "callback_data": "toggle_auto_refresh"}],
+        [{"text": "‹ К телевизорам", "callback_data": "menu"}],
+    ]}
+
+
+def settings_screen_text(cfg, target, tv=None, notice=None):
+    name = "Все телевизоры" if target == "all" else tv["name"]
+    lines = [f"⚙️ Настройки — {name}"]
+    if target != "all":
+        enabled = tv.get("auto_refresh", cfg.get("auto_refresh", False))
+        lines.extend(("", f"🔁 Автообновление: {'включено' if enabled else 'выключено'}"))
+    if notice:
+        lines.extend(("", notice))
+    return "\n".join(lines)
+
+
+def info_screen_text(cfg, tv, status):
+    _, label, icon = status
+    enabled = tv.get("auto_refresh", cfg.get("auto_refresh", False))
+    return (
+        f"ℹ️ {tv['name']}\n\n"
+        f"{icon} {label}\n"
+        f"ADB: {tv['ip']}:{tv.get('port', 5555)}\n"
+        f"MAC: {'настроен' if tv.get('mac') else 'не указан'}\n"
+        f"Сайт: {tv['url']}\n"
+        f"Автообновление: {'включено' if enabled else 'выключено'}\n"
+        f"Расписание: {format_schedule(tv.get('schedule'))}"
+    )
 
 
 def reboot_confirmation(target):
     return {"inline_keyboard": [
         [{"text": "✅ Да, перезагрузить", "callback_data": f"reboot:{target}"}],
-        [{"text": "❌ Отмена", "callback_data": f"select:{target}"}],
+        [{"text": "❌ Отмена", "callback_data": f"settings:{target}"}],
     ]}
 
 
 def delete_confirmation(target):
     return {"inline_keyboard": [
         [{"text": "⚠️ Да, удалить телевизор", "callback_data": f"delete:{target}"}],
-        [{"text": "❌ Отмена", "callback_data": f"select:{target}"}],
+        [{"text": "❌ Отмена", "callback_data": f"settings:{target}"}],
     ]}
 
 
@@ -1703,6 +1805,40 @@ def healthcheck_loop(cfg):
             time.sleep(10)
 
 
+def show_screen(cfg, chat_id, message_id, text, markup):
+    if message_id:
+        edit_message(cfg, chat_id, message_id, text, markup)
+    else:
+        send(cfg, chat_id, text, markup)
+
+
+def show_main_screen(cfg, chat_id, message_id=None, notice=None):
+    statuses = get_all_tv_statuses(cfg)
+    show_screen(
+        cfg,
+        chat_id,
+        message_id,
+        main_screen_text(statuses, notice=notice),
+        menu(cfg, statuses=statuses),
+    )
+
+
+def show_control_screen(cfg, chat_id, message_id, target, tvs, notice=None):
+    if target == "all":
+        text = target_screen_text(tvs, "⚡ Управление", notice=notice)
+        show_screen(cfg, chat_id, message_id, text, actions(cfg, target))
+        return
+    tv = tvs[0]
+    status = get_tv_status(cfg, tv)
+    show_screen(
+        cfg,
+        chat_id,
+        message_id,
+        tv_screen_text(tv, status, notice=notice),
+        actions(cfg, target, tv),
+    )
+
+
 def process(cfg, update):
     message = update.get("message")
     callback = update.get("callback_query")
@@ -1713,7 +1849,11 @@ def process(cfg, update):
     chat_id = chat.get("id")
     if callback:
         try:
-            telegram(cfg, "answerCallbackQuery", {"callback_query_id": callback["id"]})
+            payload = {"callback_query_id": callback["id"]}
+            callback_action = callback.get("data", "").split(":", 1)[0]
+            if callback_action in KEY_ACTIONS:
+                payload["text"] = KEY_ACTIONS[callback_action][1]
+            telegram(cfg, "answerCallbackQuery", payload)
         except Exception:
             pass
     if not chat_id or chat.get("type") != "private":
@@ -1731,13 +1871,13 @@ def process(cfg, update):
             PENDING_URL.pop(user_id, None)
             PENDING_ADD_TV.pop(user_id, None)
             PENDING_SCHEDULE.pop(user_id, None)
-            send(cfg, chat_id, "Выберите телевизор:", menu(cfg))
+            show_main_screen(cfg, chat_id)
             return
         if text == "/cancel":
             PENDING_URL.pop(user_id, None)
             PENDING_ADD_TV.pop(user_id, None)
             PENDING_SCHEDULE.pop(user_id, None)
-            send(cfg, chat_id, "Действие отменено.", menu(cfg))
+            show_main_screen(cfg, chat_id, notice="Действие отменено")
             return
         cmd_parts = text.split()
         cmd = cmd_parts[0].lower().split("@")[0] if cmd_parts else ""
@@ -1758,7 +1898,11 @@ def process(cfg, update):
                     return
                 is_on = is_device_reachable(ip, port, timeout=0.8)
                 note = "" if is_on else "\n(⚠️ ТВ сейчас не в сети — настройки сохранены)"
-                send(cfg, chat_id, f"🎉 Телевизор «{new_tv['name']}» ({ip}:{port}) добавлен!{note}", menu(cfg))
+                show_main_screen(
+                    cfg,
+                    chat_id,
+                    notice=f"✅ Телевизор «{new_tv['name']}» добавлен{note}",
+                )
                 return
             else:
                 PENDING_ADD_TV[user_id] = {"step": "ip"}
@@ -2021,24 +2165,24 @@ def process(cfg, update):
                 except Exception as exc:
                     send(cfg, chat_id, f"Не удалось добавить ТВ: {exc}")
                     return
-                send(
-                    cfg, chat_id,
-                    f"🎉 Телевизор «{new_tv['name']}» ({new_tv['ip']}:{new_tv['port']}) успешно добавлен!",
-                    menu(cfg)
+                show_main_screen(
+                    cfg, chat_id, notice=f"✅ Телевизор «{new_tv['name']}» добавлен"
                 )
                 return
-        send(cfg, chat_id, "Выберите телевизор:", menu(cfg))
+        show_main_screen(cfg, chat_id)
         return
     data = callback.get("data", "")
+    msg_id = callback.get("message", {}).get("message_id")
     if data == "addtv_start":
         PENDING_URL.pop(user_id, None)
         PENDING_SCHEDULE.pop(user_id, None)
         PENDING_ADD_TV[user_id] = {"step": "ip"}
-        send(
-            cfg, chat_id,
+        show_screen(
+            cfg, chat_id, msg_id,
             "➕ Добавление нового телевизора\n\n"
             "Шаг 1 из 4: Отправьте IP-адрес телевизора (например: 192.168.0.120 или 192.168.0.120:5555).\n\n"
-            "Для отмены отправьте /cancel."
+            "Для отмены отправьте /cancel.",
+            {"inline_keyboard": [[{"text": "❌ Отмена", "callback_data": "addtv:cancel"}]]},
         )
         return
     if data == "addtv:defurl":
@@ -2049,64 +2193,62 @@ def process(cfg, update):
                     cfg, add_state["name"], add_state["ip"],
                     port=add_state.get("port", 5555), mac=add_state.get("mac")
                 )
-                send(
-                    cfg, chat_id,
-                    f"🎉 Телевизор «{new_tv['name']}» ({new_tv['ip']}:{new_tv['port']}) успешно добавлен!",
-                    menu(cfg)
+                show_main_screen(
+                    cfg,
+                    chat_id,
+                    msg_id,
+                    notice=f"✅ Телевизор «{new_tv['name']}» добавлен",
                 )
             except Exception as exc:
-                send(cfg, chat_id, f"Ошибка добавления ТВ: {exc}", menu(cfg))
+                show_main_screen(cfg, chat_id, msg_id, notice=f"❌ Ошибка добавления: {exc}")
         else:
-            send(cfg, chat_id, "Сессия добавления устарела.", menu(cfg))
+            show_main_screen(cfg, chat_id, msg_id, notice="Сессия добавления устарела")
         return
     if data == "addtv:cancel":
         PENDING_ADD_TV.pop(user_id, None)
-        send(cfg, chat_id, "Добавление телевизора отменено.", menu(cfg))
+        show_main_screen(cfg, chat_id, msg_id, notice="Добавление телевизора отменено")
         return
     if data == "refresh_menu":
         PENDING_URL.pop(user_id, None)
         PENDING_ADD_TV.pop(user_id, None)
         PENDING_SCHEDULE.pop(user_id, None)
-        msg_id = callback.get("message", {}).get("message_id")
-        statuses = get_all_tv_statuses(cfg)
-        now_str = time.strftime("%H:%M:%S")
-        text = f"Телевизоры (обновлено в {now_str}):"
-        if msg_id:
-            edit_message(cfg, chat_id, msg_id, text, menu(cfg, statuses=statuses))
-        else:
-            send(cfg, chat_id, text, menu(cfg, statuses=statuses))
+        show_main_screen(cfg, chat_id, msg_id)
+        return
+    if data == "global_settings":
+        show_screen(
+            cfg,
+            chat_id,
+            msg_id,
+            "⚙️ Общие настройки\n\n"
+            f"🔁 Автообновление страниц: {'включено' if cfg.get('auto_refresh', False) else 'выключено'}",
+            global_settings(cfg),
+        )
         return
     if data == "toggle_auto_refresh":
         enabled = not cfg.get("auto_refresh", False)
         set_auto_refresh(cfg, enabled)
-        msg_id = callback.get("message", {}).get("message_id")
-        statuses = get_all_tv_statuses(cfg)
         text = (
-            "Автообновление страниц включено. Сайт будет открываться заново через заданный интервал."
+            "⚙️ Общие настройки\n\n🔁 Автообновление страниц включено"
             if enabled else
-            "Автообновление страниц выключено. Плейлисты и открытые страницы не будут перезапускаться."
+            "⚙️ Общие настройки\n\n⏸ Автообновление страниц выключено"
         )
-        if msg_id:
-            edit_message(cfg, chat_id, msg_id, text, menu(cfg, statuses=statuses))
-        else:
-            send(cfg, chat_id, text, menu(cfg, statuses=statuses))
+        show_screen(cfg, chat_id, msg_id, text, global_settings(cfg))
         return
     if data == "menu":
         PENDING_URL.pop(user_id, None)
         PENDING_ADD_TV.pop(user_id, None)
         PENDING_SCHEDULE.pop(user_id, None)
-        msg_id = callback.get("message", {}).get("message_id")
-        statuses = get_all_tv_statuses(cfg)
-        if msg_id:
-            edit_message(cfg, chat_id, msg_id, "Выберите телевизор:", menu(cfg, statuses=statuses))
-        else:
-            send(cfg, chat_id, "Выберите телевизор:", menu(cfg, statuses=statuses))
+        show_main_screen(cfg, chat_id, msg_id)
         return
     if data == "schedule_menu":
         PENDING_URL.pop(user_id, None)
         PENDING_ADD_TV.pop(user_id, None)
         PENDING_SCHEDULE.pop(user_id, None)
-        send(cfg, chat_id, "Выберите телевизор для расписания:", schedule_target_menu(cfg))
+        show_screen(
+            cfg, chat_id, msg_id,
+            "🕒 Расписание\n\nВыберите телевизор:",
+            schedule_target_menu(cfg),
+        )
         return
     try:
         action, target = data.split(":", 1)
@@ -2120,38 +2262,63 @@ def process(cfg, update):
         send(cfg, chat_id, "Кнопка устарела. Отправьте /start.")
         return
     if action == "select":
-        if target == "all":
-            send(cfg, chat_id, "📺 Управление всеми телевизорами:", actions(cfg, target))
-        else:
-            tv = tvs[0]
-            code, label, icon = get_tv_status(cfg, tv)
-            header = (
-                f"{icon} {tv['name']}\n"
-                f"Статус: {label}\n"
-                f"Адрес: {tv['ip']}:{tv.get('port', 5555)}\n"
-                f"Сайт: {tv['url']}\n\n"
-                "Выберите действие:"
-            )
-            send(cfg, chat_id, header, actions(cfg, target, tv))
+        PENDING_URL.pop(user_id, None)
+        PENDING_SCHEDULE.pop(user_id, None)
+        show_control_screen(cfg, chat_id, msg_id, target, tvs)
+        return
+    if action == "remote":
+        show_screen(
+            cfg, chat_id, msg_id,
+            target_screen_text(tvs, "🎮 Пульт"),
+            remote_controls(target),
+        )
+        return
+    if action == "sound":
+        show_screen(
+            cfg, chat_id, msg_id,
+            target_screen_text(tvs, "🔊 Звук"),
+            sound_controls(target),
+        )
+        return
+    if action == "settings":
+        PENDING_URL.pop(user_id, None)
+        tv = tvs[0] if target != "all" else None
+        show_screen(
+            cfg, chat_id, msg_id,
+            settings_screen_text(cfg, target, tv),
+            settings_controls(cfg, target, tv),
+        )
+        return
+    if action == "info" and target != "all":
+        tv = tvs[0]
+        show_screen(
+            cfg, chat_id, msg_id,
+            info_screen_text(cfg, tv, get_tv_status(cfg, tv)),
+            {"inline_keyboard": [[
+                {"text": "‹ К настройкам", "callback_data": f"settings:{target}"}
+            ]]},
+        )
         return
     if action == "tvrefresh" and target != "all":
         tv = tvs[0]
         enabled = not tv.get("auto_refresh", cfg.get("auto_refresh", False))
         set_tv_auto_refresh(cfg, tv["id"], enabled)
+        tv = next(item for item in cfg["tvs"] if item.get("id") == target)
         text = (
-            f"🔁 {tv['name']}: автообновление страниц включено."
+            "✅ Автообновление включено"
             if enabled else
-            f"⏸ {tv['name']}: автообновление страниц выключено."
+            "⏸ Автообновление выключено"
         )
-        msg_id = callback.get("message", {}).get("message_id")
-        if msg_id:
-            edit_message(cfg, chat_id, msg_id, text, actions(cfg, target, tv))
-        else:
-            send(cfg, chat_id, text, actions(cfg, target, tv))
+        show_screen(
+            cfg, chat_id, msg_id,
+            settings_screen_text(cfg, target, tv, notice=text),
+            settings_controls(cfg, target, tv),
+        )
         return
     if action == "schedule":
-        send(
-            cfg, chat_id,
+        PENDING_SCHEDULE.pop(user_id, None)
+        show_screen(
+            cfg, chat_id, msg_id,
             "🕒 Расписание\n" + schedule_summary(cfg, target),
             schedule_controls(target),
         )
@@ -2161,8 +2328,8 @@ def process(cfg, update):
         PENDING_ADD_TV.pop(user_id, None)
         PENDING_SCHEDULE[user_id] = target
         label = "всех телевизоров" if target == "all" else tvs[0]["name"]
-        send(
-            cfg, chat_id,
+        show_screen(
+            cfg, chat_id, msg_id,
             f"Настройка расписания для {label}.\n\n"
             "Отправьте одним сообщением:\n"
             "ВРЕМЯ_ВКЛЮЧЕНИЯ ВРЕМЯ_ОЖИДАНИЯ ДНИ\n\n"
@@ -2172,13 +2339,16 @@ def process(cfg, update):
             "10:00 20:00 пн,ср,пт\n\n"
             "Часовой пояс: " + cfg.get("timezone", "Asia/Almaty") + "\n"
             "Для отмены отправьте /cancel.",
+            {"inline_keyboard": [[
+                {"text": "❌ Отмена", "callback_data": f"schedule:{target}"}
+            ]]},
         )
         return
     if action == "schedoff":
         try:
             disable_schedule(cfg, target)
-            send(
-                cfg, chat_id,
+            show_screen(
+                cfg, chat_id, msg_id,
                 "⏸ Расписание отключено. Ручное управление продолжает работать.\n\n" +
                 schedule_summary(cfg, target),
                 schedule_controls(target),
@@ -2188,30 +2358,44 @@ def process(cfg, update):
         return
     if action == "rebootask":
         label = "все телевизоры" if target == "all" else tvs[0]["name"]
-        send(cfg, chat_id, f"Перезагрузить: {label}?", reboot_confirmation(target))
+        show_screen(
+            cfg, chat_id, msg_id,
+            f"⚠️ Перезагрузить {label}?",
+            reboot_confirmation(target),
+        )
         return
     if action == "deleteask":
         if len(tvs) == 1:
             tv = tvs[0]
-            send(cfg, chat_id, f"Удалить телевизор «{tv['name']}» ({tv['ip']}) из списка?", delete_confirmation(target))
+            show_screen(
+                cfg, chat_id, msg_id,
+                f"⚠️ Удалить телевизор «{tv['name']}»?",
+                delete_confirmation(target),
+            )
         else:
-            send(cfg, chat_id, "Телевизор не найден.", menu(cfg))
+            show_main_screen(cfg, chat_id, msg_id, notice="Телевизор не найден")
         return
     if action == "delete":
         try:
             deleted = delete_tv(cfg, target)
-            send(cfg, chat_id, f"🗑 Телевизор «{deleted['name']}» удален из списка.", menu(cfg))
+            show_main_screen(
+                cfg, chat_id, msg_id,
+                notice=f"🗑 Телевизор «{deleted['name']}» удалён",
+            )
         except Exception as exc:
-            send(cfg, chat_id, f"Ошибка удаления: {exc}", menu(cfg))
+            show_main_screen(cfg, chat_id, msg_id, notice=f"❌ Ошибка удаления: {exc}")
         return
     if action == "seturl":
         PENDING_SCHEDULE.pop(user_id, None)
         PENDING_URL[user_id] = target
         label = "всех телевизоров" if target == "all" else tvs[0]["name"]
-        send(
-            cfg, chat_id,
+        show_screen(
+            cfg, chat_id, msg_id,
             f"Отправьте новую HTTPS-ссылку для {label} одним сообщением.\n"
             "Для отмены отправьте /cancel.",
+            {"inline_keyboard": [[
+                {"text": "❌ Отмена", "callback_data": f"settings:{target}"}
+            ]]},
         )
         return
     if action == "screenshot":
@@ -2227,7 +2411,16 @@ def process(cfg, update):
         return
     results = operate_many(cfg, tvs, action)
     formatted = [f'{tv["name"]}: {res}' for tv, res in results]
-    send(cfg, chat_id, "\n".join(formatted))
+    notice = "\n".join(formatted)
+    if action in {"screen", "reboot"}:
+        tv = tvs[0] if target != "all" else None
+        show_screen(
+            cfg, chat_id, msg_id,
+            settings_screen_text(cfg, target, tv, notice=notice),
+            settings_controls(cfg, target, tv),
+        )
+    else:
+        show_control_screen(cfg, chat_id, msg_id, target, tvs, notice=notice)
 
 
 def safe_process(cfg, update):
