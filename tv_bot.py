@@ -2,6 +2,7 @@
 """Telegram controls for trusted Android TV devices on a local network."""
 
 import ipaddress
+import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -23,6 +24,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from tv_control import EventHistory, OperationResult, RuntimeState, StatusCache
+from tv_control import failure as operation_failure
+from tv_control import success as operation_success
+
 ROOT = Path(__file__).resolve().parent
 CONFIG = Path(os.environ.get("TV_BOT_CONFIG", ROOT / "config.json")).expanduser()
 CONFIG_LOCK = threading.RLock()
@@ -37,6 +42,17 @@ HEARTBEAT = Path(os.environ.get("TV_BOT_HEARTBEAT", "/tmp/tv_bot_heartbeat"))
 PENDING_URL = {}
 PENDING_ADD_TV = {}
 PENDING_SCHEDULE = {}
+PENDING_EDIT_TV = {}
+STATUS_CACHE = StatusCache()
+SCHEDULE_RUNTIME_KEYS = (
+    "last_on", "last_off",
+    "last_on_event", "last_off_event",
+    "last_on_attempt_event", "last_off_attempt_event",
+    "last_on_attempt_at", "last_off_attempt_at",
+    "last_on_attempts", "last_off_attempts",
+    "last_on_result", "last_off_result",
+    "last_on_success", "last_off_success",
+)
 WEEKDAY_LABELS = ("пн", "вт", "ср", "чт", "пт", "сб", "вс")
 KEY_ACTIONS = {
     "voldown": ("25", "🔉 Тише"),
@@ -57,6 +73,62 @@ KEEP_AWAKE_COMMANDS = (
     ("settings", "put", "secure", "screensaver_enabled", "0"),
     ("svc", "power", "stayon", "true"),
 )
+
+
+def state_path():
+    return Path(os.environ.get("TV_BOT_STATE", CONFIG.with_name("state.json"))).expanduser()
+
+
+def history_path():
+    return Path(
+        os.environ.get("TV_BOT_HISTORY", CONFIG.with_name("history.jsonl"))
+    ).expanduser()
+
+
+def runtime_state():
+    return RuntimeState(state_path())
+
+
+def event_history(cfg=None):
+    maximum = (cfg or {}).get("history_max_events", 1000)
+    return EventHistory(history_path(), max_events=maximum)
+
+
+def hydrate_runtime_state(televisions, state=None):
+    state = state if state is not None else runtime_state().load()
+    for tv in televisions:
+        runtime_tv = state.get("tvs", {}).get(tv.get("id"), {})
+        if "manual_sleep" in runtime_tv:
+            tv["manual_sleep"] = bool(runtime_tv["manual_sleep"])
+        schedule_state = runtime_tv.get("schedule", {})
+        if isinstance(tv.get("schedule"), dict) and isinstance(schedule_state, dict):
+            tv["schedule"].update(schedule_state)
+    return televisions
+
+
+def token_from_file():
+    token_file = os.environ.get("TV_BOT_TOKEN_FILE")
+    if not token_file:
+        return ""
+    try:
+        return Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(f"Не удалось прочитать TV_BOT_TOKEN_FILE: {exc}") from exc
+
+
+def record_event(cfg, *, event, message, success=True, tv=None, action=None, source="bot"):
+    try:
+        return event_history(cfg).append(
+            event=event,
+            message=message,
+            success=success,
+            tv=tv,
+            action=action,
+            source=source,
+        )
+    except OSError as exc:
+        log_throttled_warning("event_history", f"Не удалось записать историю: {exc}")
+        return None
 
 
 def atomic_write_config(data):
@@ -139,10 +211,14 @@ def load_config():
         with CONFIG.open(encoding="utf-8") as file:
             stored = json.load(file)
         os.chmod(CONFIG, 0o600)
-        cfg = dict(stored)
-    token = os.environ.get("TV_BOT_TOKEN", cfg.get("telegram_token", ""))
+        cfg = json.loads(json.dumps(stored))
+    external_token = token_from_file() or os.environ.get("TV_BOT_TOKEN", "").strip()
+    token = external_token or str(cfg.get("telegram_token", "")).strip()
     if not token or token.startswith("PASTE_"):
-        raise ValueError("Укажите telegram_token в config.json или TV_BOT_TOKEN")
+        raise ValueError(
+            "Укажите токен через TV_BOT_TOKEN_FILE, TV_BOT_TOKEN "
+            "или legacy-поле telegram_token"
+        )
     cfg["telegram_token"] = token
     allowed_ids = cfg.get("allowed_user_ids", [])
     if not isinstance(allowed_ids, list):
@@ -178,6 +254,15 @@ def load_config():
     cfg["log_repeat_interval_seconds"] = max(
         60, int(cfg.get("log_repeat_interval_seconds", 900))
     )
+    cfg["status_cache_seconds"] = min(
+        120, max(3, int(cfg.get("status_cache_seconds", 15)))
+    )
+    cfg["status_poll_interval_seconds"] = min(
+        120, max(5, int(cfg.get("status_poll_interval_seconds", 10)))
+    )
+    cfg["history_max_events"] = min(
+        10000, max(100, int(cfg.get("history_max_events", 1000)))
+    )
     auto_refresh = cfg.get("auto_refresh", False)
     if not isinstance(auto_refresh, bool):
         raise ValueError("auto_refresh должен быть true или false без кавычек")
@@ -203,7 +288,9 @@ def load_config():
     seen_ids = set()
     seen_endpoints = set()
     config_changed = False
-    for tv in cfg["tvs"]:
+    state = runtime_state().load()
+    state_changed = False
+    for tv_index, tv in enumerate(cfg["tvs"]):
         if not tv.get("name") or not tv.get("ip"):
             raise ValueError("У каждого ТВ нужны name и ip")
         tv["name"] = tv["name"].strip()
@@ -228,6 +315,7 @@ def load_config():
         if not re.fullmatch(r"[A-Za-z0-9_-]{6,32}", tv_id):
             tv_id = uuid.uuid4().hex[:12]
             tv["id"] = tv_id
+            stored["tvs"][tv_index]["id"] = tv_id
             config_changed = True
         endpoint = (tv["ip"], tv["port"])
         if tv_id in seen_ids:
@@ -236,9 +324,42 @@ def load_config():
             raise ValueError(f'Повторяющийся адрес телевизора: {tv["ip"]}:{tv["port"]}')
         seen_ids.add(tv_id)
         seen_endpoints.add(endpoint)
+        runtime_tv = state["tvs"].setdefault(tv_id, {})
+        if "manual_sleep" in tv:
+            runtime_tv["manual_sleep"] = bool(tv.pop("manual_sleep"))
+            state_changed = True
+            config_changed = True
+        schedule = tv.get("schedule")
+        if isinstance(schedule, dict):
+            runtime_schedule = runtime_tv.setdefault("schedule", {})
+            for key in SCHEDULE_RUNTIME_KEYS:
+                if key in schedule:
+                    runtime_schedule[key] = schedule.pop(key)
+                    state_changed = True
+                    config_changed = True
+            schedule.update(runtime_schedule)
+        if "manual_sleep" in runtime_tv:
+            tv["manual_sleep"] = bool(runtime_tv["manual_sleep"])
+        group = str(tv.get("group", "")).strip()
+        if group:
+            tv["group"] = group[:40]
+        else:
+            tv.pop("group", None)
+    if state_changed:
+        runtime_state().save(state)
     if config_changed:
         with CONFIG_LOCK:
-            atomic_write_config(stored)
+            clean = json.loads(json.dumps(stored))
+            # The deployment finalizer removes the legacy token only after the
+            # new container is healthy, preserving rollback compatibility.
+            if "telegram_token" in stored:
+                clean["telegram_token"] = stored["telegram_token"]
+            for clean_tv in clean.get("tvs", []):
+                clean_tv.pop("manual_sleep", None)
+                if isinstance(clean_tv.get("schedule"), dict):
+                    for key in SCHEDULE_RUNTIME_KEYS:
+                        clean_tv["schedule"].pop(key, None)
+            atomic_write_config(clean)
     return cfg
 
 
@@ -360,11 +481,61 @@ def set_bot_commands(cfg):
         pass
 
 
+def group_key(name):
+    digest = hashlib.sha1(name.strip().casefold().encode("utf-8")).hexdigest()[:10]
+    return f"g_{digest}"
+
+
+def tv_groups(cfg):
+    groups = {}
+    for tv in cfg.get("tvs", []):
+        name = str(tv.get("group", "")).strip()
+        if name:
+            groups.setdefault(name, []).append(tv)
+    return groups
+
+
+def resolve_target(cfg, target):
+    if target == "all":
+        return list(cfg.get("tvs", []))
+    if target.startswith("g_"):
+        for name, televisions in tv_groups(cfg).items():
+            if group_key(name) == target:
+                return list(televisions)
+        return []
+    return [tv for tv in cfg.get("tvs", []) if tv.get("id") == target]
+
+
+def matching_tvs(tvs, target):
+    if target == "all":
+        return list(tvs)
+    if target.startswith("g_"):
+        return [tv for tv in tvs if tv.get("group") and group_key(tv["group"]) == target]
+    return [tv for tv in tvs if tv.get("id") == target]
+
+
 def menu(cfg, statuses=None):
     if statuses is None:
         statuses = get_all_tv_statuses(cfg)
     rows = []
+    groups = tv_groups(cfg)
+    grouped_ids = {tv["id"] for televisions in groups.values() for tv in televisions}
+    for group_name, televisions in groups.items():
+        icons = [statuses.get(tv["id"], ("unknown", "...", "⚪"))[2] for tv in televisions]
+        summary_icon = "🟢" if icons and all(icon == "🟢" for icon in icons) else "📁"
+        rows.append([{
+            "text": f"{summary_icon} {group_name} · {len(televisions)} ТВ",
+            "callback_data": f"select:{group_key(group_name)}",
+        }])
+        for tv in televisions:
+            _, _, icon = statuses.get(tv["id"], ("offline", "...", "⚪"))
+            rows.append([{
+                "text": f"   {icon} {tv['name']}",
+                "callback_data": f"select:{tv['id']}",
+            }])
     for tv in cfg["tvs"]:
+        if tv["id"] in grouped_ids:
+            continue
         _, _, icon = statuses.get(tv["id"], ("offline", "...", "⚪"))
         rows.append([{"text": f"{icon} {tv['name']}", "callback_data": f"select:{tv['id']}"}])
     if len(cfg["tvs"]) > 1:
@@ -378,7 +549,10 @@ def menu(cfg, statuses=None):
         {"text": "🕒 Расписание", "callback_data": "schedule_menu"},
         {"text": "＋ Добавить ТВ", "callback_data": "addtv_start"},
     ])
-    rows.append([{"text": "⚙️ Общие настройки", "callback_data": "global_settings"}])
+    rows.append([
+        {"text": "🧾 История", "callback_data": "history:all"},
+        {"text": "⚙️ Общие настройки", "callback_data": "global_settings"},
+    ])
     return {"inline_keyboard": rows}
 
 
@@ -416,8 +590,16 @@ def tv_screen_text(tv, status, notice=None):
     return "\n".join(lines)
 
 
-def target_screen_text(tvs, title, notice=None):
-    name = "Все телевизоры" if len(tvs) > 1 else tvs[0]["name"]
+def target_label(tvs, target=None):
+    if target == "all":
+        return "Все телевизоры"
+    if target and target.startswith("g_"):
+        return str(tvs[0].get("group", "Группа")) if tvs else "Группа"
+    return tvs[0]["name"] if len(tvs) == 1 else "Выбранные телевизоры"
+
+
+def target_screen_text(tvs, title, notice=None, target=None):
+    name = target_label(tvs, target)
     lines = [f"{title} — {name}"]
     if notice:
         lines.extend(("", notice))
@@ -482,13 +664,21 @@ def settings_controls(cfg, target, tv=None):
         [{"text": "🔄 Перезагрузить", "callback_data": f"rebootask:{target}"}],
     ]
     if target != "all":
-        refresh_enabled = tv.get("auto_refresh", cfg.get("auto_refresh", False)) if tv else False
-        rows.insert(0, [{
-            "text": f"🔁 Автообновление: {'ВКЛ' if refresh_enabled else 'ВЫКЛ'}",
-            "callback_data": f"tvrefresh:{target}",
-        }])
-        rows.append([{"text": "ℹ️ Информация", "callback_data": f"info:{target}"}])
-        rows.append([{"text": "🗑 Удалить телевизор", "callback_data": f"deleteask:{target}"}])
+        if tv is not None:
+            refresh_enabled = tv.get("auto_refresh", cfg.get("auto_refresh", False))
+            rows.insert(0, [{
+                "text": f"🔁 Автообновление: {'ВКЛ' if refresh_enabled else 'ВЫКЛ'}",
+                "callback_data": f"tvrefresh:{target}",
+            }])
+            rows.append([
+                {"text": "✏️ Данные ТВ", "callback_data": f"edit:{target}"},
+                {"text": "🩺 Диагностика", "callback_data": f"diag:{target}"},
+            ])
+            rows.append([
+                {"text": "ℹ️ Информация", "callback_data": f"info:{target}"},
+                {"text": "🧾 История", "callback_data": f"history:{target}"},
+            ])
+            rows.append([{"text": "🗑 Удалить телевизор", "callback_data": f"deleteask:{target}"}])
     rows.append([{"text": "‹ К управлению", "callback_data": f"select:{target}"}])
     return {"inline_keyboard": rows}
 
@@ -502,9 +692,9 @@ def global_settings(cfg):
 
 
 def settings_screen_text(cfg, target, tv=None, notice=None):
-    name = "Все телевизоры" if target == "all" else tv["name"]
+    name = "Все телевизоры" if target == "all" else (tv["name"] if tv else "Группа")
     lines = [f"⚙️ Настройки — {name}"]
-    if target != "all":
+    if target != "all" and tv is not None:
         enabled = tv.get("auto_refresh", cfg.get("auto_refresh", False))
         lines.extend(("", f"🔁 Автообновление: {'включено' if enabled else 'выключено'}"))
     if notice:
@@ -526,6 +716,73 @@ def info_screen_text(cfg, tv, status):
     )
 
 
+def edit_tv_controls(cfg, tv):
+    tv_id = tv["id"]
+    index = next(
+        (position for position, item in enumerate(cfg.get("tvs", []))
+         if item.get("id") == tv_id),
+        0,
+    )
+    rows = [
+        [{"text": "Название", "callback_data": f"editname:{tv_id}"},
+         {"text": "IP и порт", "callback_data": f"editaddr:{tv_id}"}],
+        [{"text": "MAC", "callback_data": f"editmac:{tv_id}"},
+         {"text": "Группа", "callback_data": f"editgroup:{tv_id}"}],
+    ]
+    move_row = []
+    if index > 0:
+        move_row.append({"text": "↑ Выше", "callback_data": f"moveup:{tv_id}"})
+    if index < len(cfg.get("tvs", [])) - 1:
+        move_row.append({"text": "↓ Ниже", "callback_data": f"movedown:{tv_id}"})
+    if move_row:
+        rows.append(move_row)
+    rows.append([{"text": "‹ К настройкам", "callback_data": f"settings:{tv_id}"}])
+    return {"inline_keyboard": rows}
+
+
+def edit_tv_screen_text(tv, notice=None):
+    lines = [
+        f"✏️ Данные — {tv['name']}",
+        "",
+        f"Адрес: {tv['ip']}:{tv.get('port', 5555)}",
+        f"MAC: {tv.get('mac', 'не указан')}",
+        f"Группа: {tv.get('group', 'без группы')}",
+        "",
+        "Порядок телевизоров меняется кнопками ↑ и ↓.",
+    ]
+    if notice:
+        lines.extend(("", notice))
+    return "\n".join(lines)
+
+
+def diagnostics_controls(tv_id):
+    return {"inline_keyboard": [
+        [{"text": "🔄 Проверить снова", "callback_data": f"diag:{tv_id}"}],
+        [{"text": "🔌 Переподключить ADB", "callback_data": f"reconnect:{tv_id}"},
+         {"text": "🌐 Проверить сайт", "callback_data": f"testsite:{tv_id}"}],
+        [{"text": "‹ К настройкам", "callback_data": f"settings:{tv_id}"}],
+    ]}
+
+
+def format_history(cfg, tv_id=None, limit=15):
+    entries = event_history(cfg).recent(limit=limit, tv_id=tv_id)
+    if not entries:
+        return "Событий пока нет."
+    timezone = ZoneInfo(cfg.get("timezone", "Asia/Almaty"))
+    lines = []
+    for entry in entries:
+        try:
+            timestamp = datetime.fromisoformat(entry["at"])
+            at = timestamp.astimezone(timezone).strftime("%d.%m %H:%M")
+        except (KeyError, ValueError):
+            at = "—"
+        icon = "✅" if entry.get("success", False) else "❌"
+        name = entry.get("tv_name")
+        prefix = f"{name}: " if name else ""
+        lines.append(f"{icon} {at} · {prefix}{entry.get('message', 'Событие')}")
+    return "\n".join(lines)
+
+
 def reboot_confirmation(target):
     return {"inline_keyboard": [
         [{"text": "✅ Да, перезагрузить", "callback_data": f"reboot:{target}"}],
@@ -545,6 +802,11 @@ def schedule_target_menu(cfg):
         [{"text": f"📺 {tv['name']}", "callback_data": f"schedule:{tv['id']}"}]
         for tv in cfg["tvs"]
     ]
+    for name in tv_groups(cfg):
+        rows.append([{
+            "text": f"📁 Группа: {name}",
+            "callback_data": f"schedule:{group_key(name)}",
+        }])
     if len(cfg["tvs"]) > 1:
         rows.append([{"text": "📺 Все телевизоры", "callback_data": "schedule:all"}])
     rows.append([{"text": "↩ Главное меню", "callback_data": "menu"}])
@@ -961,51 +1223,198 @@ def get_tv_status(cfg, tv):
         return _get_tv_status_unlocked(cfg, tv)
 
 
-def get_all_tv_statuses(cfg):
+def refresh_status_cache(cfg, tvs=None):
+    """Refresh selected TVs in parallel and return the resulting snapshot."""
+    tvs = list(tvs if tvs is not None else cfg.get("tvs", []))
+    if not tvs:
+        return {}
+    results = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(tvs)), thread_name_prefix="status") as pool:
+        future_map = {pool.submit(get_tv_status, cfg, tv): tv for tv in tvs}
+        for future in as_completed(future_map):
+            tv = future_map[future]
+            error = ""
+            try:
+                status = future.result()
+            except Exception as exc:
+                status = ("offline", "Оффлайн", "🔴")
+                error = str(exc)
+            STATUS_CACHE.put(tv["id"], status, error=error)
+            results[tv["id"]] = status
+    return results
+
+
+def get_cached_tv_status(cfg, tv, force=False):
+    maximum_age = cfg.get("status_cache_seconds", 15)
+    cached = STATUS_CACHE.get(tv["id"], max_age=maximum_age)
+    if not force and cached is not None:
+        return cached["status"]
+    return refresh_status_cache(cfg, [tv])[tv["id"]]
+
+
+def get_all_tv_statuses(cfg, force=False):
     tvs = cfg.get("tvs", [])
     if not tvs:
         return {}
-    with ThreadPoolExecutor(max_workers=min(8, len(tvs)), thread_name_prefix="status") as pool:
-        future_map = {pool.submit(get_tv_status, cfg, tv): tv["id"] for tv in tvs}
-        results = {}
-        for future in as_completed(future_map):
-            ip = future_map[future]
-            try:
-                results[ip] = future.result()
-            except Exception:
-                results[ip] = ("offline", "Оффлайн", "🔴")
-        return results
+    ids = [tv["id"] for tv in tvs]
+    cached = STATUS_CACHE.statuses(ids, include_stale=True)
+    if force or len(cached) != len(tvs):
+        return refresh_status_cache(cfg, tvs)
+    return cached
+
+
+def _status_loop_forever(cfg):
+    while True:
+        with CONFIG_LOCK:
+            televisions = [dict(tv) for tv in cfg.get("tvs", [])]
+            interval = cfg.get("status_poll_interval_seconds", 10)
+        refresh_status_cache(cfg, televisions)
+        STATUS_CACHE.prune(tv["id"] for tv in televisions)
+        time.sleep(interval)
+
+
+def status_loop(cfg):
+    while True:
+        try:
+            _status_loop_forever(cfg)
+        except Exception:
+            logging.exception("Фоновый кэш статусов аварийно перезапускается")
+            time.sleep(10)
+
+
+def run_diagnostics(cfg, tv, check_website=True):
+    port = int(tv.get("port", 5555))
+    reachable = is_device_reachable(tv["ip"], port, timeout=1.0)
+    result = {
+        "reachable": reachable,
+        "adb": False,
+        "power": "unknown",
+        "site": None,
+        "site_detail": "не проверен",
+        "error": "",
+    }
+    if reachable:
+        address, error = connect(cfg, tv, wake=False)
+        if address:
+            result["adb"] = True
+            result["power"] = read_power_state(cfg, address)
+        else:
+            result["error"] = error
+    else:
+        result["error"] = f"Порт {port} недоступен"
+    if check_website:
+        result["site"], result["site_detail"] = check_site(tv["url"])
+    if not reachable:
+        status = (
+            ("sleep", "Сон", "💤") if tv.get("manual_sleep")
+            else ("offline", "Оффлайн", "🔴")
+        )
+    elif not result["adb"]:
+        status = (
+            ("unauthorized", "Не авторизован", "🟡")
+            if "авториз" in result["error"].casefold() or "unauthorized" in result["error"].casefold()
+            else ("offline", "ADB оффлайн", "🔴")
+        )
+    elif result["power"] == "on":
+        status = ("on", "Включен", "🟢")
+    elif result["power"] == "sleep":
+        status = ("sleep", "Сон", "💤")
+    else:
+        status = ("unknown", "Состояние неизвестно", "⚪")
+    STATUS_CACHE.put(tv["id"], status, error=result["error"])
+    return result
+
+
+def diagnostics_screen_text(cfg, tv, result, notice=None):
+    power_labels = {"on": "экран включён", "sleep": "сон", "unknown": "неизвестно"}
+    cached = STATUS_CACHE.get(tv["id"])
+    cache_age = f"{int(cached['age'])} сек." if cached else "нет данных"
+    lines = [
+        f"🩺 Диагностика — {tv['name']}",
+        "",
+        f"{'✅' if result['reachable'] else '❌'} ADB-порт {tv['ip']}:{tv.get('port', 5555)}",
+        f"{'✅' if result['adb'] else '❌'} Авторизация ADB",
+        f"🖥 Питание: {power_labels.get(result['power'], result['power'])}",
+        f"{'✅' if result['site'] else '❌'} Сайт: {result['site_detail']}",
+        f"🗃 Кэш статуса: {cache_age}",
+    ]
+    latest = event_history(cfg).recent(limit=1, tv_id=tv["id"])
+    if latest:
+        lines.append(f"🧾 Последнее: {latest[0].get('message', '—')}")
+    if result.get("error"):
+        lines.extend(("", f"Ошибка: {result['error']}"))
+    if notice:
+        lines.extend(("", notice))
+    return "\n".join(lines)
+
+
+def reconnect_tv(cfg, tv):
+    port = int(tv.get("port", 5555))
+    address = f"{tv['ip']}:{port}"
+    if not is_device_reachable(tv["ip"], port, timeout=1.0):
+        adb(cfg, "disconnect", address, timeout=2)
+        result = operation_failure(
+            f"Порт {port} недоступен — переподключение невозможно", "port_closed"
+        )
+    else:
+        adb(cfg, "disconnect", address, timeout=2)
+        connected, error = connect(cfg, tv, wake=False)
+        result = (
+            operation_success("ADB успешно переподключён", "adb_reconnected")
+            if connected
+            else operation_failure(f"Не удалось переподключить ADB: {error}", "adb_reconnect_failed")
+        )
+    STATUS_CACHE.invalidate(tv["id"])
+    record_event(
+        cfg, event="diagnostic", message=str(result),
+        success=operation_succeeded(result), tv=tv,
+        action="reconnect", source="diagnostic",
+    )
+    return result
 
 
 def _operate_unlocked(cfg, tv, action, url_override=None):
     if action not in {"on", "off", "web", "both", "screen", "reboot"} and action not in KEY_ACTIONS:
-        return "Неизвестная команда"
+        return operation_failure("Неизвестная команда", "unknown_action")
     if action in {"on", "both"}:
         set_manual_sleep(cfg, tv["id"], False)
     address, error = connect(cfg, tv, wake=action in {"on", "both"})
     if not address:
-        return f"Не удалось связаться с ТВ: {error[:200]}"
+        return operation_failure(
+            f"Не удалось связаться с ТВ: {error[:200]}", "connect_failed", error
+        )
     if action in KEY_ACTIONS:
         keycode, label = KEY_ACTIONS[action]
         ok, output = adb(cfg, "-s", address, "shell", "input", "keyevent", keycode)
-        return f"{label} выполнено" if ok else f"Ошибка: {output[:200]}"
+        if ok:
+            return operation_success(f"{label} выполнено", "key_sent")
+        return operation_failure(f"Ошибка: {output[:200]}", "key_failed", output)
     if action in {"on", "both"}:
         ok, output = wake_tv_with_retry(cfg, tv, address)
         if not ok:
-            return f"Не удалось разбудить ТВ: {output[:200]}"
+            return operation_failure(
+                f"Не удалось разбудить ТВ: {output[:200]}", "wake_failed", output
+            )
     if action == "off":
         ok, output = adb(cfg, "-s", address, "shell", "input", "keyevent", "223")
         if ok:
             set_manual_sleep(cfg, tv["id"], True)
-        return "Отправлена команда ожидания" if ok else f"Ошибка: {output[:200]}"
+        if ok:
+            return operation_success("Отправлена команда ожидания", "standby_sent")
+        return operation_failure(f"Ошибка: {output[:200]}", "standby_failed", output)
     if action == "screen":
         ok, output = apply_keep_awake_settings(cfg, address)
         if not ok:
-            return f"Не удалось применить настройки: {output[:200]}"
-        return "Заставка и автоматический сон отключены"
+            return operation_failure(
+                f"Не удалось применить настройки: {output[:200]}",
+                "keep_awake_failed", output,
+            )
+        return operation_success("Заставка и автоматический сон отключены", "keep_awake")
     if action == "reboot":
         ok, output = adb(cfg, "-s", address, "reboot")
-        return "Команда перезагрузки отправлена" if ok else f"Ошибка: {output[:200]}"
+        if ok:
+            return operation_success("Команда перезагрузки отправлена", "reboot_sent")
+        return operation_failure(f"Ошибка: {output[:200]}", "reboot_failed", output)
     if action in {"web", "both"}:
         if action == "both":
             time.sleep(3)
@@ -1015,14 +1424,31 @@ def _operate_unlocked(cfg, tv, action, url_override=None):
             timeout=20,
         )
         if not ok or "Error:" in output or "unable to resolve" in output.lower():
-            return f"Не удалось открыть сайт: {output[:250]}"
-        return "Команда открытия сайта отправлена — проверьте экран ТВ"
-    return "Команда пробуждения отправлена — проверьте экран ТВ"
+            return operation_failure(
+                f"Не удалось открыть сайт: {output[:250]}", "web_failed", output
+            )
+        return operation_success(
+            "Команда открытия сайта отправлена — проверьте экран ТВ", "web_opened"
+        )
+    return operation_success(
+        "Команда пробуждения отправлена — проверьте экран ТВ", "wake_sent"
+    )
 
 
 def operate(cfg, tv, action, url_override=None):
     with get_tv_lock(tv):
-        return _operate_unlocked(cfg, tv, action, url_override=url_override)
+        result = _operate_unlocked(cfg, tv, action, url_override=url_override)
+    STATUS_CACHE.invalidate(tv.get("id"))
+    record_event(
+        cfg,
+        event="command",
+        message=str(result),
+        success=operation_succeeded(result),
+        tv=tv,
+        action=action,
+        source="command",
+    )
+    return result
 
 
 def operate_many(cfg, tvs, action, url_override=None):
@@ -1039,7 +1465,7 @@ def operate_many(cfg, tvs, action, url_override=None):
             try:
                 res = future.result()
             except Exception as exc:
-                res = f"Ошибка: {exc}"
+                res = operation_failure(f"Ошибка: {exc}", "exception", str(exc))
             results.append((tv, res))
         tv_order = {tv["id"]: i for i, tv in enumerate(tvs)}
         results.sort(key=lambda item: tv_order.get(item[0]["id"], 0))
@@ -1115,9 +1541,21 @@ def handle_screenshots(cfg, chat_id, tvs):
             filename = f"screenshot_{safe_name}_{int(time.time())}.png"
             try:
                 send_photo(cfg, chat_id, data, caption=caption, filename=filename)
+                record_event(
+                    cfg, event="screenshot", message="Скриншот отправлен",
+                    success=True, tv=tv, action="screenshot", source="command",
+                )
             except Exception as exc:
+                record_event(
+                    cfg, event="screenshot", message=f"Ошибка скриншота: {exc}",
+                    success=False, tv=tv, action="screenshot", source="command",
+                )
                 send(cfg, chat_id, f'Не удалось отправить снимок экрана {tv["name"]}: {exc}')
         else:
+            record_event(
+                cfg, event="screenshot", message=f"Ошибка скриншота: {error}",
+                success=False, tv=tv, action="screenshot", source="command",
+            )
             send(cfg, chat_id, f'Ошибка скриншота с {tv["name"]}: {error}')
 
 
@@ -1236,9 +1674,7 @@ def format_schedule(schedule):
 
 
 def schedule_summary(cfg, target):
-    televisions = cfg["tvs"] if target == "all" else [
-        tv for tv in cfg["tvs"] if tv.get("id") == target
-    ]
+    televisions = matching_tvs(cfg["tvs"], target)
     if not televisions:
         raise ValueError("Телевизор не найден")
     lines = [f"Часовой пояс: {cfg.get('timezone', 'Asia/Almaty')}"]
@@ -1255,24 +1691,24 @@ def save_schedule(cfg, target, schedule):
         with CONFIG.open(encoding="utf-8") as file:
             stored = json.load(file)
         televisions = stored.get("tvs", [])
-        matches = televisions if target == "all" else [
-            tv for tv in televisions if tv.get("id") == target
-        ]
+        matches = matching_tvs(televisions, target)
         if not matches:
             raise ValueError("Телевизор не найден")
         for tv in matches:
             tv["schedule"] = dict(normalized)
         atomic_write_config(stored)
-        cfg["tvs"] = stored["tvs"]
+        state = runtime_state().load()
+        for tv in matches:
+            state["tvs"].setdefault(tv["id"], {})["schedule"] = {}
+        runtime_state().save(state)
+        cfg["tvs"] = hydrate_runtime_state(stored["tvs"], state=state)
 
 
 def disable_schedule(cfg, target):
     with CONFIG_LOCK:
         with CONFIG.open(encoding="utf-8") as file:
             stored = json.load(file)
-        matches = stored.get("tvs", []) if target == "all" else [
-            tv for tv in stored.get("tvs", []) if tv.get("id") == target
-        ]
+        matches = matching_tvs(stored.get("tvs", []), target)
         if not matches:
             raise ValueError("Телевизор не найден")
         for tv in matches:
@@ -1280,7 +1716,7 @@ def disable_schedule(cfg, target):
             current["enabled"] = False
             tv["schedule"] = normalize_schedule(current)
         atomic_write_config(stored)
-        cfg["tvs"] = stored["tvs"]
+        cfg["tvs"] = hydrate_runtime_state(stored["tvs"])
 
 
 def check_site(url):
@@ -1309,16 +1745,16 @@ def save_url(cfg, target, url):
     with CONFIG_LOCK:
         with CONFIG.open(encoding="utf-8") as file:
             stored = json.load(file)
-        if target == "all":
-            indices = range(len(stored["tvs"]))
-        else:
-            indices = [i for i, tv in enumerate(stored["tvs"]) if tv.get("id") == target]
-            if not indices:
-                raise ValueError("Телевизор не найден")
+        indices = [
+            index for index, tv in enumerate(stored["tvs"])
+            if tv in matching_tvs(stored["tvs"], target)
+        ]
+        if not indices:
+            raise ValueError("Телевизор не найден")
         for index in indices:
             stored["tvs"][index]["url"] = url
         atomic_write_config(stored)
-        cfg["tvs"] = stored["tvs"]
+        cfg["tvs"] = hydrate_runtime_state(stored["tvs"])
 
 
 def parse_ip_port(value):
@@ -1394,8 +1830,91 @@ def add_tv(cfg, name, ip, port=5555, url=None, mac=None):
             new_tv["mac"] = normalized_mac
         stored.setdefault("tvs", []).append(new_tv)
         atomic_write_config(stored)
-        cfg["tvs"] = stored["tvs"]
+        cfg["tvs"] = hydrate_runtime_state(stored["tvs"])
+        STATUS_CACHE.invalidate(new_tv["id"])
+        record_event(
+            cfg, event="tv_added", message="Телевизор добавлен",
+            success=True, tv=new_tv, source="settings",
+        )
         return new_tv
+
+
+def update_tv(cfg, tv_id, *, name=None, ip=None, port=None, mac=None, group=None):
+    """Validate and update editable TV fields without changing its stable ID."""
+    with CONFIG_LOCK:
+        with CONFIG.open(encoding="utf-8") as file:
+            stored = json.load(file)
+        tv = next((item for item in stored.get("tvs", []) if item.get("id") == tv_id), None)
+        if tv is None:
+            raise ValueError("Телевизор не найден")
+        if name is not None:
+            cleaned_name = str(name).strip()
+            if not cleaned_name or len(cleaned_name) > 60:
+                raise ValueError("Название должно быть от 1 до 60 символов")
+            tv["name"] = cleaned_name
+        if ip is not None or port is not None:
+            new_ip = str(ipaddress.IPv4Address(str(ip if ip is not None else tv["ip"])))
+            new_port = int(port if port is not None else tv.get("port", 5555))
+            if not (1 <= new_port <= 65535):
+                raise ValueError("Неверный ADB-порт")
+            if any(
+                item.get("id") != tv_id
+                and item.get("ip") == new_ip
+                and int(item.get("port", 5555)) == new_port
+                for item in stored.get("tvs", [])
+            ):
+                raise ValueError(f"Телевизор {new_ip}:{new_port} уже добавлен")
+            tv["ip"], tv["port"] = new_ip, new_port
+        if mac is not None:
+            if str(mac).strip():
+                normalized_mac = validate_mac(str(mac))
+                if any(
+                    item.get("id") != tv_id
+                    and item.get("mac", "").upper().replace("-", ":") == normalized_mac
+                    for item in stored.get("tvs", [])
+                ):
+                    raise ValueError(f"Телевизор с MAC {normalized_mac} уже добавлен")
+                tv["mac"] = normalized_mac
+            else:
+                tv.pop("mac", None)
+        if group is not None:
+            cleaned_group = str(group).strip()
+            if len(cleaned_group) > 40:
+                raise ValueError("Название группы должно быть не длиннее 40 символов")
+            if cleaned_group:
+                tv["group"] = cleaned_group
+            else:
+                tv.pop("group", None)
+        atomic_write_config(stored)
+        cfg["tvs"] = hydrate_runtime_state(stored["tvs"])
+        current = next(item for item in cfg["tvs"] if item.get("id") == tv_id)
+    STATUS_CACHE.invalidate(tv_id)
+    record_event(
+        cfg, event="tv_updated", message="Данные телевизора изменены",
+        success=True, tv=current, source="settings",
+    )
+    return current
+
+
+def move_tv(cfg, tv_id, direction):
+    with CONFIG_LOCK:
+        with CONFIG.open(encoding="utf-8") as file:
+            stored = json.load(file)
+        index = next(
+            (position for position, tv in enumerate(stored.get("tvs", []))
+             if tv.get("id") == tv_id),
+            None,
+        )
+        if index is None:
+            raise ValueError("Телевизор не найден")
+        new_index = index + (-1 if direction == "up" else 1)
+        if 0 <= new_index < len(stored["tvs"]):
+            stored["tvs"][index], stored["tvs"][new_index] = (
+                stored["tvs"][new_index], stored["tvs"][index]
+            )
+            atomic_write_config(stored)
+            cfg["tvs"] = hydrate_runtime_state(stored["tvs"])
+        return next(tv for tv in cfg["tvs"] if tv.get("id") == tv_id)
 
 
 def delete_tv(cfg, tv_id):
@@ -1412,26 +1931,26 @@ def delete_tv(cfg, tv_id):
             raise ValueError("Телевизор не найден")
         deleted = stored["tvs"].pop(index)
         atomic_write_config(stored)
-        cfg["tvs"] = stored["tvs"]
+        cfg["tvs"] = hydrate_runtime_state(stored["tvs"])
+        runtime_state().remove_tv(tv_id)
+        STATUS_CACHE.invalidate(tv_id)
+        record_event(
+            cfg, event="tv_deleted", message="Телевизор удалён",
+            success=True, tv=deleted, source="settings",
+        )
         return deleted
 
 
 def set_manual_sleep(cfg, tv_id, enabled):
     """Persist an explicit standby request so the watchdog respects it."""
     with CONFIG_LOCK:
-        with CONFIG.open(encoding="utf-8") as file:
-            stored = json.load(file)
-        stored_tv = next(
-            (tv for tv in stored.get("tvs", []) if tv.get("id") == tv_id), None
+        current_tv = next(
+            (tv for tv in cfg.get("tvs", []) if tv.get("id") == tv_id), None
         )
-        if stored_tv is None:
+        if current_tv is None:
             raise ValueError("Телевизор не найден")
-        stored_tv["manual_sleep"] = bool(enabled)
-        atomic_write_config(stored)
-        for current_tv in cfg.get("tvs", []):
-            if current_tv.get("id") == tv_id:
-                current_tv["manual_sleep"] = bool(enabled)
-                break
+        runtime_state().update_tv(tv_id, {"manual_sleep": bool(enabled)})
+        current_tv["manual_sleep"] = bool(enabled)
 
 
 def set_auto_refresh(cfg, enabled):
@@ -1540,35 +2059,51 @@ def schedule_retry_ready(cfg, schedule, action, event_at, now):
 
 
 def operation_succeeded(result):
-    return not result.startswith(("Не удалось", "Ошибка"))
+    if isinstance(result, OperationResult):
+        return result.success
+    return not str(result).startswith(("Не удалось", "Ошибка"))
 
 
 def record_schedule_attempts(cfg, action, events, results, attempted_at):
     result_by_id = {tv["id"]: result for tv, result in results}
     with CONFIG_LOCK:
-        with CONFIG.open(encoding="utf-8") as file:
-            stored = json.load(file)
-        for tv in stored.get("tvs", []):
+        state = runtime_state().load()
+        for tv in cfg.get("tvs", []):
             tv_id = tv.get("id")
             if tv_id not in events or not isinstance(tv.get("schedule"), dict):
                 continue
             event_at = events[tv_id]
             event_key = schedule_event_key(action, event_at)
             schedule = tv["schedule"]
+            runtime_schedule = state["tvs"].setdefault(tv_id, {}).setdefault(
+                "schedule", {}
+            )
             previous_event = schedule.get(f"last_{action}_attempt_event")
             attempts = int(schedule.get(f"last_{action}_attempts", 0)) if previous_event == event_key else 0
             result = result_by_id.get(tv_id, "Ошибка: результат операции отсутствует")
             success = operation_succeeded(result)
-            schedule[f"last_{action}_attempt_event"] = event_key
-            schedule[f"last_{action}_attempt_at"] = attempted_at.isoformat(timespec="seconds")
-            schedule[f"last_{action}_attempts"] = attempts + 1
-            schedule[f"last_{action}_result"] = result[:500]
-            schedule[f"last_{action}_success"] = success
+            updates = {
+                f"last_{action}_attempt_event": event_key,
+                f"last_{action}_attempt_at": attempted_at.isoformat(timespec="seconds"),
+                f"last_{action}_attempts": attempts + 1,
+                f"last_{action}_result": str(result)[:500],
+                f"last_{action}_success": success,
+            }
             if success:
-                schedule[f"last_{action}"] = event_at.strftime("%Y-%m-%d")
-                schedule[f"last_{action}_event"] = event_key
-        atomic_write_config(stored)
-        cfg["tvs"] = stored["tvs"]
+                updates[f"last_{action}"] = event_at.strftime("%Y-%m-%d")
+                updates[f"last_{action}_event"] = event_key
+            schedule.update(updates)
+            runtime_schedule.update(updates)
+            record_event(
+                cfg,
+                event="schedule",
+                message=str(result),
+                success=success,
+                tv=tv,
+                action=action,
+                source="schedule",
+            )
+        runtime_state().save(state)
 
 
 def run_due_schedules(cfg, now=None):
@@ -1666,7 +2201,7 @@ def _refresh_loop_forever(cfg):
         if refresh_tvs:
             # Smart Refresh: обновляем только те ТВ, которые реально бодрствуют (статус 'on')
             # Это исключает пробуждение спящих телевизоров командой am start
-            statuses = list(pool.map(lambda t: get_tv_status(cfg, t)[0], refresh_tvs))
+            statuses = list(pool.map(lambda t: get_cached_tv_status(cfg, t)[0], refresh_tvs))
             awake_tvs = [tv for tv, st in zip(refresh_tvs, statuses) if st == "on"]
             if awake_tvs:
                 jobs = {
@@ -1680,7 +2215,7 @@ def _refresh_loop_forever(cfg):
                         result = job.result()
                     except Exception as exc:
                         result = f"Ошибка: {exc}"
-                    if result.startswith("Не удалось") or result.startswith("Ошибка"):
+                    if not operation_succeeded(result):
                         log_throttled_warning(
                             log_key,
                             f'Автообновление {tv["name"]}: {result}',
@@ -1759,11 +2294,21 @@ def _healthcheck_loop_forever(cfg):
                 state, available, failure_threshold, recovery_threshold
             )
             if transition == "up":
+                record_event(
+                    cfg, event="site_recovered",
+                    message=f"Сайт снова доступен: {detail}", success=True,
+                    source="monitor",
+                )
                 notify_owners(
                     cfg,
                     f"✅ Сайт снова доступен\n{url}\nТВ: {tv_names}\n{detail}",
                 )
             elif transition == "down":
+                record_event(
+                    cfg, event="site_down",
+                    message=f"Сайт недоступен: {detail}", success=False,
+                    source="monitor",
+                )
                 notify_owners(
                     cfg,
                     f"🚨 Сайт недоступен\n{url}\nТВ: {tv_names}\nПричина: {detail}",
@@ -1781,11 +2326,19 @@ def _healthcheck_loop_forever(cfg):
                 state, online, failure_threshold, recovery_threshold
             )
             if transition == "up":
+                record_event(
+                    cfg, event="tv_recovered", message="Телевизор снова в сети",
+                    success=True, tv=tv, source="monitor",
+                )
                 notify_owners(
                     cfg,
                     f"🟢 Телевизор снова в сети\nТВ: {tv['name']} ({tv['ip']})",
                 )
             elif transition == "down":
+                record_event(
+                    cfg, event="tv_down", message="Телевизор отключился от сети",
+                    success=False, tv=tv, source="monitor",
+                )
                 notify_owners(
                     cfg,
                     f"⚠️ Телевизор отключился от сети\nТВ: {tv['name']} ({tv['ip']})",
@@ -1812,8 +2365,8 @@ def show_screen(cfg, chat_id, message_id, text, markup):
         send(cfg, chat_id, text, markup)
 
 
-def show_main_screen(cfg, chat_id, message_id=None, notice=None):
-    statuses = get_all_tv_statuses(cfg)
+def show_main_screen(cfg, chat_id, message_id=None, notice=None, force=False):
+    statuses = get_all_tv_statuses(cfg, force=force)
     show_screen(
         cfg,
         chat_id,
@@ -1824,12 +2377,12 @@ def show_main_screen(cfg, chat_id, message_id=None, notice=None):
 
 
 def show_control_screen(cfg, chat_id, message_id, target, tvs, notice=None):
-    if target == "all":
-        text = target_screen_text(tvs, "⚡ Управление", notice=notice)
+    if target == "all" or target.startswith("g_") or len(tvs) > 1:
+        text = target_screen_text(tvs, "⚡ Управление", notice=notice, target=target)
         show_screen(cfg, chat_id, message_id, text, actions(cfg, target))
         return
     tv = tvs[0]
-    status = get_tv_status(cfg, tv)
+    status = get_cached_tv_status(cfg, tv)
     show_screen(
         cfg,
         chat_id,
@@ -1837,6 +2390,13 @@ def show_control_screen(cfg, chat_id, message_id, target, tvs, notice=None):
         tv_screen_text(tv, status, notice=notice),
         actions(cfg, target, tv),
     )
+
+
+def clear_pending(user_id):
+    PENDING_URL.pop(user_id, None)
+    PENDING_ADD_TV.pop(user_id, None)
+    PENDING_SCHEDULE.pop(user_id, None)
+    PENDING_EDIT_TV.pop(user_id, None)
 
 
 def process(cfg, update):
@@ -1868,15 +2428,11 @@ def process(cfg, update):
     if message:
         text = message.get("text", "").strip()
         if text.startswith("/start") or text == "/menu":
-            PENDING_URL.pop(user_id, None)
-            PENDING_ADD_TV.pop(user_id, None)
-            PENDING_SCHEDULE.pop(user_id, None)
+            clear_pending(user_id)
             show_main_screen(cfg, chat_id)
             return
         if text == "/cancel":
-            PENDING_URL.pop(user_id, None)
-            PENDING_ADD_TV.pop(user_id, None)
-            PENDING_SCHEDULE.pop(user_id, None)
+            clear_pending(user_id)
             show_main_screen(cfg, chat_id, notice="Действие отменено")
             return
         cmd_parts = text.split()
@@ -2012,6 +2568,36 @@ def process(cfg, update):
             formatted = [f'{tv["name"]}: {res}' for tv, res in results]
             send(cfg, chat_id, "\n".join(formatted))
             return
+        edit_state = PENDING_EDIT_TV.get(user_id)
+        if edit_state is not None:
+            tv_id = edit_state["tv_id"]
+            field = edit_state["field"]
+            try:
+                if field == "name":
+                    updated = update_tv(cfg, tv_id, name=text)
+                elif field == "address":
+                    ip, port = parse_ip_port(text)
+                    updated = update_tv(cfg, tv_id, ip=ip, port=port)
+                elif field == "mac":
+                    value = "" if text.casefold() in {"удалить", "нет", "-"} else text
+                    updated = update_tv(cfg, tv_id, mac=value)
+                elif field == "group":
+                    value = "" if text.casefold() in {"без группы", "удалить", "нет", "-"} else text
+                    updated = update_tv(cfg, tv_id, group=value)
+                else:
+                    raise ValueError("Неизвестное поле")
+            except (ValueError, OSError, json.JSONDecodeError) as exc:
+                send(
+                    cfg, chat_id,
+                    f"❌ Данные не сохранены: {exc}\nПопробуйте ещё раз или /cancel.",
+                )
+                return
+            PENDING_EDIT_TV.pop(user_id, None)
+            send(
+                cfg, chat_id, edit_tv_screen_text(updated, "✅ Данные сохранены"),
+                edit_tv_controls(cfg, updated),
+            )
+            return
         schedule_target = PENDING_SCHEDULE.get(user_id)
         if schedule_target is not None:
             try:
@@ -2056,11 +2642,7 @@ def process(cfg, update):
                 send(cfg, chat_id, f"Не удалось сохранить адрес: {exc}")
                 return
             PENDING_URL.pop(user_id, None)
-            televisions = (
-                list(cfg["tvs"])
-                if target == "all"
-                else [tv for tv in cfg["tvs"] if tv.get("id") == target]
-            )
+            televisions = resolve_target(cfg, target)
             if not televisions:
                 send(cfg, chat_id, "Кнопка устарела. Откройте /start заново.")
                 return
@@ -2209,10 +2791,8 @@ def process(cfg, update):
         show_main_screen(cfg, chat_id, msg_id, notice="Добавление телевизора отменено")
         return
     if data == "refresh_menu":
-        PENDING_URL.pop(user_id, None)
-        PENDING_ADD_TV.pop(user_id, None)
-        PENDING_SCHEDULE.pop(user_id, None)
-        show_main_screen(cfg, chat_id, msg_id)
+        clear_pending(user_id)
+        show_main_screen(cfg, chat_id, msg_id, force=True)
         return
     if data == "global_settings":
         show_screen(
@@ -2235,9 +2815,7 @@ def process(cfg, update):
         show_screen(cfg, chat_id, msg_id, text, global_settings(cfg))
         return
     if data == "menu":
-        PENDING_URL.pop(user_id, None)
-        PENDING_ADD_TV.pop(user_id, None)
-        PENDING_SCHEDULE.pop(user_id, None)
+        clear_pending(user_id)
         show_main_screen(cfg, chat_id, msg_id)
         return
     if data == "schedule_menu":
@@ -2252,10 +2830,7 @@ def process(cfg, update):
         return
     try:
         action, target = data.split(":", 1)
-        if target == "all":
-            tvs = list(cfg["tvs"])
-        else:
-            tvs = [tv for tv in cfg["tvs"] if tv.get("id") == target]
+        tvs = resolve_target(cfg, target)
         if not tvs:
             raise ValueError("Неверный ТВ")
     except ValueError:
@@ -2269,37 +2844,121 @@ def process(cfg, update):
     if action == "remote":
         show_screen(
             cfg, chat_id, msg_id,
-            target_screen_text(tvs, "🎮 Пульт"),
+            target_screen_text(tvs, "🎮 Пульт", target=target),
             remote_controls(target),
         )
         return
     if action == "sound":
         show_screen(
             cfg, chat_id, msg_id,
-            target_screen_text(tvs, "🔊 Звук"),
+            target_screen_text(tvs, "🔊 Звук", target=target),
             sound_controls(target),
         )
         return
     if action == "settings":
         PENDING_URL.pop(user_id, None)
-        tv = tvs[0] if target != "all" else None
+        PENDING_EDIT_TV.pop(user_id, None)
+        tv = tvs[0] if len(tvs) == 1 and not target.startswith("g_") else None
         show_screen(
             cfg, chat_id, msg_id,
-            settings_screen_text(cfg, target, tv),
+            settings_screen_text(cfg, target, tv).replace(
+                "— Группа", f"— {target_label(tvs, target)}"
+            ),
             settings_controls(cfg, target, tv),
         )
         return
-    if action == "info" and target != "all":
+    if action == "info" and len(tvs) == 1 and not target.startswith("g_"):
         tv = tvs[0]
         show_screen(
             cfg, chat_id, msg_id,
-            info_screen_text(cfg, tv, get_tv_status(cfg, tv)),
+            info_screen_text(cfg, tv, get_cached_tv_status(cfg, tv)),
             {"inline_keyboard": [[
                 {"text": "‹ К настройкам", "callback_data": f"settings:{target}"}
             ]]},
         )
         return
-    if action == "tvrefresh" and target != "all":
+    if action == "history":
+        title = "🧾 История — все телевизоры" if target == "all" else f"🧾 История — {target_label(tvs, target)}"
+        back = "menu" if target == "all" else f"settings:{target}"
+        show_screen(
+            cfg, chat_id, msg_id,
+            title + "\n\n" + format_history(cfg, None if target == "all" else tvs[0]["id"]),
+            {"inline_keyboard": [[{"text": "🔄 Обновить", "callback_data": f"history:{target}"}],
+                                  [{"text": "‹ Назад", "callback_data": back}]]},
+        )
+        return
+    if action == "edit" and len(tvs) == 1 and not target.startswith("g_"):
+        PENDING_EDIT_TV.pop(user_id, None)
+        tv = tvs[0]
+        show_screen(cfg, chat_id, msg_id, edit_tv_screen_text(tv), edit_tv_controls(cfg, tv))
+        return
+    if action in {"editname", "editaddr", "editmac", "editgroup"} and len(tvs) == 1:
+        clear_pending(user_id)
+        tv = tvs[0]
+        field = {
+            "editname": "name", "editaddr": "address",
+            "editmac": "mac", "editgroup": "group",
+        }[action]
+        PENDING_EDIT_TV[user_id] = {"tv_id": tv["id"], "field": field}
+        prompts = {
+            "name": "Отправьте новое название (до 60 символов).",
+            "address": "Отправьте новый адрес как IP или IP:порт.",
+            "mac": "Отправьте MAC AA:BB:CC:DD:EE:FF. Для удаления отправьте «удалить».",
+            "group": "Отправьте название группы. Для удаления отправьте «без группы».",
+        }
+        show_screen(
+            cfg, chat_id, msg_id,
+            f"✏️ {tv['name']}\n\n{prompts[field]}\n\nДля отмены отправьте /cancel.",
+            {"inline_keyboard": [[{"text": "❌ Отмена", "callback_data": f"edit:{tv['id']}"}]]},
+        )
+        return
+    if action in {"moveup", "movedown"} and len(tvs) == 1:
+        tv = move_tv(cfg, target, "up" if action == "moveup" else "down")
+        show_screen(
+            cfg, chat_id, msg_id,
+            edit_tv_screen_text(tv, "✅ Порядок изменён"),
+            edit_tv_controls(cfg, tv),
+        )
+        return
+    if action == "diag" and len(tvs) == 1 and not target.startswith("g_"):
+        tv = tvs[0]
+        diagnostic = run_diagnostics(cfg, tv)
+        success = diagnostic["reachable"] and diagnostic["adb"] and bool(diagnostic["site"])
+        record_event(
+            cfg, event="diagnostic", message="Полная диагностика выполнена",
+            success=success, tv=tv, action="diagnostics", source="diagnostic",
+        )
+        show_screen(
+            cfg, chat_id, msg_id,
+            diagnostics_screen_text(cfg, tv, diagnostic), diagnostics_controls(tv["id"]),
+        )
+        return
+    if action == "reconnect" and len(tvs) == 1:
+        tv = tvs[0]
+        reconnect_result = reconnect_tv(cfg, tv)
+        diagnostic = run_diagnostics(cfg, tv)
+        show_screen(
+            cfg, chat_id, msg_id,
+            diagnostics_screen_text(cfg, tv, diagnostic, notice=str(reconnect_result)),
+            diagnostics_controls(tv["id"]),
+        )
+        return
+    if action == "testsite" and len(tvs) == 1:
+        tv = tvs[0]
+        available, detail = check_site(tv["url"])
+        record_event(
+            cfg, event="site_check", message=f"Проверка сайта: {detail}",
+            success=available, tv=tv, action="testsite", source="diagnostic",
+        )
+        diagnostic = run_diagnostics(cfg, tv)
+        notice = f"{'✅' if available else '❌'} Проверка сайта: {detail}"
+        show_screen(
+            cfg, chat_id, msg_id,
+            diagnostics_screen_text(cfg, tv, diagnostic, notice=notice),
+            diagnostics_controls(tv["id"]),
+        )
+        return
+    if action == "tvrefresh" and len(tvs) == 1 and not target.startswith("g_"):
         tv = tvs[0]
         enabled = not tv.get("auto_refresh", cfg.get("auto_refresh", False))
         set_tv_auto_refresh(cfg, tv["id"], enabled)
@@ -2327,7 +2986,7 @@ def process(cfg, update):
         PENDING_URL.pop(user_id, None)
         PENDING_ADD_TV.pop(user_id, None)
         PENDING_SCHEDULE[user_id] = target
-        label = "всех телевизоров" if target == "all" else tvs[0]["name"]
+        label = target_label(tvs, target)
         show_screen(
             cfg, chat_id, msg_id,
             f"Настройка расписания для {label}.\n\n"
@@ -2357,7 +3016,7 @@ def process(cfg, update):
             send(cfg, chat_id, f"Не удалось отключить расписание: {exc}")
         return
     if action == "rebootask":
-        label = "все телевизоры" if target == "all" else tvs[0]["name"]
+        label = target_label(tvs, target)
         show_screen(
             cfg, chat_id, msg_id,
             f"⚠️ Перезагрузить {label}?",
@@ -2388,7 +3047,7 @@ def process(cfg, update):
     if action == "seturl":
         PENDING_SCHEDULE.pop(user_id, None)
         PENDING_URL[user_id] = target
-        label = "всех телевизоров" if target == "all" else tvs[0]["name"]
+        label = target_label(tvs, target)
         show_screen(
             cfg, chat_id, msg_id,
             f"Отправьте новую HTTPS-ссылку для {label} одним сообщением.\n"
@@ -2403,7 +3062,7 @@ def process(cfg, update):
         return
     if action in KEY_ACTIONS:
         results = operate_many(cfg, tvs, action)
-        errors = [res for _, res in results if res.startswith("Не удалось") or res.startswith("Ошибка")]
+        errors = [res for _, res in results if not operation_succeeded(res)]
         if errors:
             send(cfg, chat_id, f"❌ {errors[0]}")
         return
@@ -2413,10 +3072,12 @@ def process(cfg, update):
     formatted = [f'{tv["name"]}: {res}' for tv, res in results]
     notice = "\n".join(formatted)
     if action in {"screen", "reboot"}:
-        tv = tvs[0] if target != "all" else None
+        tv = tvs[0] if len(tvs) == 1 and not target.startswith("g_") else None
         show_screen(
             cfg, chat_id, msg_id,
-            settings_screen_text(cfg, target, tv, notice=notice),
+            settings_screen_text(cfg, target, tv, notice=notice).replace(
+                "— Группа", f"— {target_label(tvs, target)}"
+            ),
             settings_controls(cfg, target, tv),
         )
     else:
@@ -2503,6 +3164,7 @@ def main():
     set_bot_commands(cfg)
     # Skip commands accumulated while the bot was offline.
     offset = get_initial_update_offset(cfg)
+    threading.Thread(target=status_loop, args=(cfg,), daemon=True).start()
     threading.Thread(target=refresh_loop, args=(cfg,), daemon=True).start()
     if cfg["keep_awake"]:
         threading.Thread(target=keep_awake_loop, args=(cfg,), daemon=True).start()

@@ -3,7 +3,10 @@ config.json
 data/
 adb/
 *.json.tmp
+state.json
+history.jsonl
 .env
+secrets/
 
 # Python artifacts
 __pycache__/

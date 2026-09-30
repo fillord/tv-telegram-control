@@ -10,7 +10,8 @@ ROLLBACK_TAG="tv-telegram-control:pre-deploy-${STAMP}"
 
 rollback() {
   echo "Rolling back to ${ROLLBACK_TAG}" >&2
-  ssh "${TARGET}" "docker image tag '${ROLLBACK_TAG}' tv-telegram-control-tv-telegram-control:latest && \
+  ssh "${TARGET}" "cp -a '${BACKUP_DIR}/data/config.json' '${REMOTE_DIR}/data/config.json' && \
+    docker image tag '${ROLLBACK_TAG}' tv-telegram-control-tv-telegram-control:latest && \
     cd '${REMOTE_DIR}' && docker compose up -d --force-recreate --no-build"
 }
 
@@ -19,8 +20,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
 ssh "${TARGET}" "set -eu; umask 077; \
   mkdir -p '${BACKUP_DIR}'; \
-  cp -a '${REMOTE_DIR}/data/config.json' '${REMOTE_DIR}/compose.yaml' \
+  cp -a '${REMOTE_DIR}/data' '${REMOTE_DIR}/compose.yaml' \
     '${REMOTE_DIR}/Dockerfile' '${REMOTE_DIR}/tv_bot.py' '${BACKUP_DIR}/'; \
+  if [ -d '${REMOTE_DIR}/secrets' ]; then cp -a '${REMOTE_DIR}/secrets' '${BACKUP_DIR}/'; fi; \
   cp -a '${REMOTE_DIR}/adb' '${BACKUP_DIR}/'; \
   image_id=\$(docker inspect --format '{{.Image}}' tv-telegram-control); \
   docker image tag \"\${image_id}\" '${ROLLBACK_TAG}'"
@@ -36,9 +38,12 @@ rsync -av \
   tv_bot.py \
   "${TARGET}:${REMOTE_DIR}/"
 rsync -av tests/test_tv_bot.py "${TARGET}:${REMOTE_DIR}/tests/"
+rsync -av tv_control "${TARGET}:${REMOTE_DIR}/"
+rsync -av scripts/migrate_token.py "${TARGET}:${REMOTE_DIR}/scripts/"
 
 ssh "${TARGET}" "cd '${REMOTE_DIR}' && \
-  chmod 700 data adb logs && \
+  python3 scripts/migrate_token.py prepare data/config.json secrets/telegram_token && \
+  chmod 700 data adb logs secrets && \
   chmod 600 data/config.json adb/adbkey && \
   docker compose build && \
   docker compose run --rm tv-telegram-control python3 /app/tv_bot.py --check-config && \
@@ -47,6 +52,9 @@ ssh "${TARGET}" "cd '${REMOTE_DIR}' && \
 for _ in $(seq 1 18); do
   status="$(ssh "${TARGET}" "docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' tv-telegram-control")"
   if [[ "${status}" == "healthy" ]]; then
+    ssh "${TARGET}" "cd '${REMOTE_DIR}' && \
+      python3 scripts/migrate_token.py finalize data/config.json secrets/telegram_token && \
+      chmod 600 data/config.json secrets/telegram_token"
     ssh "${TARGET}" "cd '${REMOTE_DIR}' && docker compose ps"
     exit 0
   fi

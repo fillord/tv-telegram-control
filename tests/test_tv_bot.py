@@ -79,6 +79,45 @@ class ConfigTests(unittest.TestCase):
             cfg = tv_bot.load_config()
         self.assertEqual(cfg["adb_path"], "/bin/echo")
 
+    def test_environment_adb_override_is_not_written_to_config(self):
+        with mock.patch.dict(os.environ, {"TV_BOT_ADB_PATH": "/usr/bin/env"}):
+            cfg = tv_bot.load_config()
+        stored = json.loads(self.config.read_text(encoding="utf-8"))
+        self.assertEqual(cfg["adb_path"], "/usr/bin/env")
+        self.assertEqual(stored["adb_path"], "/bin/echo")
+
+    def test_mutable_runtime_fields_are_migrated_out_of_config(self):
+        stored = json.loads(self.config.read_text(encoding="utf-8"))
+        stored["tvs"][0]["manual_sleep"] = True
+        stored["tvs"][0]["schedule"] = {
+            "enabled": True, "on": "09:00", "off": "22:00",
+            "days": list(range(7)), "last_on": "2026-09-29",
+        }
+        self.config.write_text(json.dumps(stored), encoding="utf-8")
+        cfg = tv_bot.load_config()
+        clean = json.loads(self.config.read_text(encoding="utf-8"))
+        state = json.loads(self.config.with_name("state.json").read_text(encoding="utf-8"))
+        tv_id = cfg["tvs"][0]["id"]
+        self.assertNotIn("manual_sleep", clean["tvs"][0])
+        self.assertNotIn("last_on", clean["tvs"][0]["schedule"])
+        self.assertTrue(state["tvs"][tv_id]["manual_sleep"])
+        self.assertEqual(state["tvs"][tv_id]["schedule"]["last_on"], "2026-09-29")
+
+    def test_tv_can_be_edited_grouped_and_reordered(self):
+        cfg = tv_bot.load_config()
+        first = cfg["tvs"][0]
+        second = tv_bot.add_tv(cfg, "Второй", "192.168.0.11")
+        updated = tv_bot.update_tv(
+            cfg, second["id"], name="Ресепшен", ip="192.168.0.12",
+            port=5566, mac="AA-BB-CC-DD-EE-FF", group="Первый этаж",
+        )
+        self.assertEqual(updated["name"], "Ресепшен")
+        self.assertEqual(updated["group"], "Первый этаж")
+        self.assertEqual(updated["mac"], "AA:BB:CC:DD:EE:FF")
+        tv_bot.move_tv(cfg, second["id"], "up")
+        self.assertEqual(cfg["tvs"][0]["id"], second["id"])
+        self.assertEqual(cfg["tvs"][1]["id"], first["id"])
+
 
 class ParsingTests(unittest.TestCase):
     def test_quick_add_supports_multiword_name(self):
@@ -263,6 +302,38 @@ class InterfaceTests(unittest.TestCase):
             tv_bot.edit_message({}, 123, 5, "same")
         send.assert_not_called()
 
+    def test_group_button_targets_all_tvs_in_group(self):
+        second = sample_tv("tv000002", "Вход", "192.168.0.11")
+        self.tv["group"] = "Первый этаж"
+        second["group"] = "Первый этаж"
+        cfg = {"auto_refresh": False, "tvs": [self.tv, second]}
+        keyboard = tv_bot.menu(cfg, statuses={})["inline_keyboard"]
+        target = tv_bot.group_key("Первый этаж")
+        callbacks = [button["callback_data"] for row in keyboard for button in row]
+        self.assertIn(f"select:{target}", callbacks)
+        self.assertEqual(len(tv_bot.resolve_target(cfg, target)), 2)
+
+
+class RuntimeComponentTests(unittest.TestCase):
+    def test_structured_result_remains_string_compatible(self):
+        result = tv_bot.operation_failure("Ошибка: тест", "test_error", "detail")
+        self.assertIsInstance(result, str)
+        self.assertFalse(result.success)
+        self.assertEqual(result.code, "test_error")
+        self.assertFalse(tv_bot.operation_succeeded(result))
+
+    def test_status_cache_avoids_repeated_adb_probe(self):
+        tv_bot.STATUS_CACHE.invalidate()
+        tv = sample_tv()
+        cfg = {"tvs": [tv], "status_cache_seconds": 15}
+        with mock.patch.object(
+            tv_bot, "get_tv_status", return_value=("on", "Включен", "🟢")
+        ) as status:
+            first = tv_bot.get_cached_tv_status(cfg, tv)
+            second = tv_bot.get_cached_tv_status(cfg, tv)
+        self.assertEqual(first, second)
+        status.assert_called_once()
+
 
 class DispatcherTests(unittest.TestCase):
     def test_updates_are_ordered_per_user(self):
@@ -329,7 +400,10 @@ class DeviceSafetyTests(unittest.TestCase):
                 active -= 1
             return "ok"
 
-        with mock.patch.object(tv_bot, "_operate_unlocked", side_effect=operation):
+        with (
+            mock.patch.object(tv_bot, "_operate_unlocked", side_effect=operation),
+            mock.patch.object(tv_bot, "record_event"),
+        ):
             threads = [
                 threading.Thread(target=tv_bot.operate, args=({}, tv, "off"))
                 for _ in range(3)
@@ -583,7 +657,11 @@ class ScheduleTests(unittest.TestCase):
         operate.assert_called_once()
         self.assertEqual(operate.call_args.args[2], "both")
         stored = json.loads(self.config.read_text(encoding="utf-8"))
-        self.assertEqual(stored["tvs"][0]["schedule"]["last_on"], "2026-09-28")
+        self.assertNotIn("last_on", stored["tvs"][0]["schedule"])
+        state = json.loads(self.config.with_name("state.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["tvs"][self.tv["id"]]["schedule"]["last_on"], "2026-09-28"
+        )
 
     def test_scheduled_off_uses_standby_action(self):
         cfg = dict(self.stored)
@@ -613,8 +691,10 @@ class ScheduleTests(unittest.TestCase):
             completed = tv_bot.run_due_schedules(cfg, monday)
         operate.assert_not_called()
         self.assertEqual(completed[0][2], "Режим ожидания уже установлен")
-        stored = json.loads(self.config.read_text(encoding="utf-8"))
-        self.assertEqual(stored["tvs"][0]["schedule"]["last_off"], "2026-09-28")
+        state = json.loads(self.config.with_name("state.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            state["tvs"][self.tv["id"]]["schedule"]["last_off"], "2026-09-28"
+        )
 
     def test_missed_schedule_is_reconciled_after_startup(self):
         cfg = dict(self.stored)
@@ -653,15 +733,19 @@ class ScheduleTests(unittest.TestCase):
             mock.patch.object(tv_bot, "notify_owners"),
         ):
             first = tv_bot.run_due_schedules(cfg, first_at)
-            stored_after_failure = json.loads(self.config.read_text(encoding="utf-8"))
+            state_after_failure = json.loads(
+                self.config.with_name("state.json").read_text(encoding="utf-8")
+            )
             second = tv_bot.run_due_schedules(cfg, second_at)
         self.assertEqual(len(first), 1)
         self.assertEqual(len(second), 1)
         self.assertEqual(operate.call_count, 2)
-        failed_schedule = stored_after_failure["tvs"][0]["schedule"]
+        failed_schedule = state_after_failure["tvs"][self.tv["id"]]["schedule"]
         self.assertNotIn("last_on", failed_schedule)
         self.assertFalse(failed_schedule["last_on_success"])
-        final_schedule = json.loads(self.config.read_text(encoding="utf-8"))["tvs"][0]["schedule"]
+        final_schedule = json.loads(
+            self.config.with_name("state.json").read_text(encoding="utf-8")
+        )["tvs"][self.tv["id"]]["schedule"]
         self.assertEqual(final_schedule["last_on"], "2026-09-28")
         self.assertTrue(final_schedule["last_on_success"])
 

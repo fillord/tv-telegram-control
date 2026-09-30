@@ -7,6 +7,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY tv_bot.py /app/tv_bot.py
+COPY tv_control /app/tv_control
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD ["python3", "/app/tv_bot.py", "--healthcheck"]

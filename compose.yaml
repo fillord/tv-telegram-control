@@ -12,6 +12,9 @@ services:
       HOME: /app/home
       TV_BOT_ADB_PATH: /usr/bin/adb
       TV_BOT_CONFIG: /app/data/config.json
+      TV_BOT_STATE: /app/data/state.json
+      TV_BOT_HISTORY: /app/data/history.jsonl
+      TV_BOT_TOKEN_FILE: /run/secrets/telegram_token
       TV_BOT_LOG_DIR: /app/logs
       TV_BOT_HEARTBEAT: /tmp/tv_bot_heartbeat
       TZ: Asia/Almaty
@@ -19,3 +22,9 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./adb:/app/home/.android
+    secrets:
+      - telegram_token
+
+secrets:
+  telegram_token:
+    file: ./secrets/telegram_token

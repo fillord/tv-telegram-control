@@ -1,5 +1,4 @@
 {
-  "telegram_token": "PASTE_YOUR_TELEGRAM_BOT_TOKEN_HERE",
   "allowed_user_ids": [
     123456789
   ],
@@ -16,6 +15,9 @@
   "schedule_retry_attempts": 3,
   "schedule_retry_delay_seconds": 60,
   "log_repeat_interval_seconds": 900,
+  "status_cache_seconds": 15,
+  "status_poll_interval_seconds": 10,
+  "history_max_events": 1000,
   "timezone": "Asia/Almaty",
   "tvs": [
     {
@@ -25,18 +27,29 @@
       "url": "https://example.org/tv",
       "mac": "AA:BB:CC:DD:EE:FF",
       "auto_refresh": true,
+      "group": "Первый этаж",
       "schedule": {
         "enabled": true,
         "on": "09:00",
         "off": "22:00",
-        "days": [0, 1, 2, 3, 4, 5, 6]
-      }
+        "days": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6
+        ]
+      },
+      "id": "tv_example_01"
     },
     {
       "name": "Телевизор 2 (пример)",
       "ip": "192.168.0.109",
       "port": 5555,
-      "url": "https://example.org/tv"
+      "url": "https://example.org/tv",
+      "id": "tv_example_02"
     }
   ]
 }

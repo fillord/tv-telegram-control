@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Compile
+        run: python -m compileall -q tv_bot.py tv_control tests
+      - name: Unit and integration tests
+        run: python -m unittest discover -s tests -v
+      - name: Validate example configuration
+        env:
+          TV_BOT_CONFIG: config.example.json
+          TV_BOT_TOKEN: ci-placeholder-token
+          TV_BOT_ADB_PATH: /bin/true
+        run: python tv_bot.py --check-config
+      - name: Build container
+        run: docker build -t tv-telegram-control:ci .
