@@ -7,5 +7,7 @@ logs
 adb
 data
 config.json
+.env
 tests
 secrets
+backups

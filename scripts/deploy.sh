@@ -2,34 +2,81 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TARGET="${TV_BOT_DEPLOY_TARGET:-yola@100.68.109.75}"
-REMOTE_DIR="${TV_BOT_REMOTE_DIR:-/home/yola/docker/tv-telegram-control}"
+: "${TV_BOT_DEPLOY_TARGET:?Set TV_BOT_DEPLOY_TARGET, for example admin@10.0.0.10}"
+: "${TV_BOT_REMOTE_DIR:?Set TV_BOT_REMOTE_DIR, for example /opt/tv-telegram-control}"
+
+TARGET="${TV_BOT_DEPLOY_TARGET}"
+REMOTE_DIR="${TV_BOT_REMOTE_DIR}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-BACKUP_DIR="/home/yola/backups/tv-telegram-control/${STAMP}"
+BACKUP_DIR="${REMOTE_DIR}/backups/${STAMP}"
 ROLLBACK_TAG="tv-telegram-control:pre-deploy-${STAMP}"
+BACKUP_READY=0
+
+if [[ ! "${TARGET}" =~ ^[A-Za-z0-9._@:-]+$ ]]; then
+  echo "TV_BOT_DEPLOY_TARGET contains unsupported characters" >&2
+  exit 2
+fi
+if [[ ! "${REMOTE_DIR}" =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ "${REMOTE_DIR}" == *".."* ]]; then
+  echo "TV_BOT_REMOTE_DIR must be a safe absolute path" >&2
+  exit 2
+fi
+case "${REMOTE_DIR}" in
+  /|/home|/root|/opt|/srv|/var)
+    echo "TV_BOT_REMOTE_DIR is too broad" >&2
+    exit 2
+    ;;
+esac
 
 rollback() {
-  echo "Rolling back to ${ROLLBACK_TAG}" >&2
-  ssh "${TARGET}" "cp -a '${BACKUP_DIR}/data/config.json' '${REMOTE_DIR}/data/config.json' && \
-    docker image tag '${ROLLBACK_TAG}' tv-telegram-control-tv-telegram-control:latest && \
-    cd '${REMOTE_DIR}' && docker compose up -d --force-recreate --no-build"
+  echo "Deployment failed; restoring ${BACKUP_DIR}" >&2
+  ssh "${TARGET}" "set -eu; \
+    if [ -d '${BACKUP_DIR}/project' ]; then cp -a '${BACKUP_DIR}/project/.' '${REMOTE_DIR}/'; fi; \
+    if [ -d '${BACKUP_DIR}/runtime' ]; then cp -a '${BACKUP_DIR}/runtime/.' '${REMOTE_DIR}/'; fi; \
+    if docker image inspect '${ROLLBACK_TAG}' >/dev/null 2>&1; then \
+      cd '${REMOTE_DIR}'; \
+      image_name=\$(docker compose config --images | head -n 1); \
+      docker image tag '${ROLLBACK_TAG}' \"\${image_name}\"; \
+      docker compose up -d --force-recreate --no-build; \
+    fi"
 }
+
+rollback_on_error() {
+  status=$?
+  trap - ERR
+  if [[ "${BACKUP_READY}" == "1" ]]; then
+    rollback || true
+  fi
+  exit "${status}"
+}
+
+trap rollback_on_error ERR
 
 cd "${ROOT_DIR}"
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 
-ssh "${TARGET}" "set -eu; umask 077; \
-  mkdir -p '${BACKUP_DIR}'; \
-  cp -a '${REMOTE_DIR}/data' '${REMOTE_DIR}/compose.yaml' \
-    '${REMOTE_DIR}/Dockerfile' '${REMOTE_DIR}/tv_bot.py' '${BACKUP_DIR}/'; \
-  if [ -d '${REMOTE_DIR}/secrets' ]; then cp -a '${REMOTE_DIR}/secrets' '${BACKUP_DIR}/'; fi; \
-  cp -a '${REMOTE_DIR}/adb' '${BACKUP_DIR}/'; \
-  image_id=\$(docker inspect --format '{{.Image}}' tv-telegram-control); \
-  docker image tag \"\${image_id}\" '${ROLLBACK_TAG}'"
+ssh "${TARGET}" "set -eu; \
+  test -d '${REMOTE_DIR}'; \
+  test -f '${REMOTE_DIR}/data/config.json'; \
+  test -s '${REMOTE_DIR}/secrets/telegram_token'; \
+  test -f '${REMOTE_DIR}/.env'; \
+  cd '${REMOTE_DIR}'; \
+  docker compose version >/dev/null; \
+  docker compose config --quiet; \
+  mkdir -p '${BACKUP_DIR}/project' '${BACKUP_DIR}/runtime'; \
+  for item in Dockerfile README.md compose.yaml config.example.json tv_bot.py tv_control scripts; do \
+    if [ -e \"\${item}\" ]; then cp -a \"\${item}\" '${BACKUP_DIR}/project/'; fi; \
+  done; \
+  for item in data secrets adb .env; do cp -a \"\${item}\" '${BACKUP_DIR}/runtime/'; done; \
+  container_id=\$(docker compose ps -q tv-telegram-control); \
+  if [ -n \"\${container_id}\" ]; then \
+    image_id=\$(docker inspect --format '{{.Image}}' \"\${container_id}\"); \
+    docker image tag \"\${image_id}\" '${ROLLBACK_TAG}'; \
+  fi"
+BACKUP_READY=1
 
-ssh "${TARGET}" "mkdir -p '${REMOTE_DIR}/tests'"
 rsync -av \
   .dockerignore \
+  .env.example \
   .gitignore \
   Dockerfile \
   README.md \
@@ -37,37 +84,38 @@ rsync -av \
   config.example.json \
   tv_bot.py \
   "${TARGET}:${REMOTE_DIR}/"
-rsync -av tests/test_tv_bot.py "${TARGET}:${REMOTE_DIR}/tests/"
-rsync -av tv_control "${TARGET}:${REMOTE_DIR}/"
-rsync -av scripts/migrate_token.py "${TARGET}:${REMOTE_DIR}/scripts/"
+rsync -av tests tv_control scripts "${TARGET}:${REMOTE_DIR}/"
 
-ssh "${TARGET}" "cd '${REMOTE_DIR}' && \
-  python3 scripts/migrate_token.py prepare data/config.json secrets/telegram_token && \
-  chmod 700 data adb logs secrets && \
-  chmod 600 data/config.json adb/adbkey && \
-  docker compose build && \
-  docker compose run --rm tv-telegram-control python3 /app/tv_bot.py --check-config && \
+ssh "${TARGET}" "set -eu; \
+  cd '${REMOTE_DIR}'; \
+  python3 scripts/migrate_token.py prepare data/config.json secrets/telegram_token; \
+  chmod 700 data adb logs secrets; \
+  chmod 600 .env data/config.json secrets/telegram_token; \
+  if [ -f adb/adbkey ]; then chmod 600 adb/adbkey; fi; \
+  docker compose config --quiet; \
+  docker compose build; \
+  docker compose run --rm tv-telegram-control python3 /app/tv_bot.py --check-config; \
   docker compose up -d"
 
 for _ in $(seq 1 18); do
-  status="$(ssh "${TARGET}" "docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' tv-telegram-control")"
+  status="$(ssh "${TARGET}" "cd '${REMOTE_DIR}'; container_id=\$(docker compose ps -q tv-telegram-control); if [ -z \"\${container_id}\" ]; then echo missing; else docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \"\${container_id}\"; fi")"
   if [[ "${status}" == "healthy" ]]; then
-    ssh "${TARGET}" "cd '${REMOTE_DIR}' && \
-      python3 scripts/migrate_token.py finalize data/config.json secrets/telegram_token && \
-      chmod 600 data/config.json secrets/telegram_token"
-    ssh "${TARGET}" "cd '${REMOTE_DIR}' && docker compose ps"
+    ssh "${TARGET}" "set -eu; cd '${REMOTE_DIR}'; \
+      python3 scripts/migrate_token.py finalize data/config.json secrets/telegram_token; \
+      chmod 600 data/config.json secrets/telegram_token; \
+      docker compose ps"
+    echo "Deployment completed. Backup: ${BACKUP_DIR}"
+    trap - ERR
     exit 0
   fi
-  if [[ "${status}" == "unhealthy" ]]; then
-    ssh "${TARGET}" "cd '${REMOTE_DIR}' && docker compose logs --tail=100 --no-color"
-    rollback
-    echo "Deployment failed: container is unhealthy" >&2
+  if [[ "${status}" == "unhealthy" || "${status}" == "missing" ]]; then
+    ssh "${TARGET}" "cd '${REMOTE_DIR}' && docker compose logs --tail=100 --no-color" || true
+    rollback || true
     exit 1
   fi
   sleep 10
 done
 
-ssh "${TARGET}" "cd '${REMOTE_DIR}' && docker compose logs --tail=100 --no-color"
-rollback
-echo "Deployment failed: health check did not become healthy in time" >&2
+ssh "${TARGET}" "cd '${REMOTE_DIR}' && docker compose logs --tail=100 --no-color" || true
+rollback || true
 exit 1

@@ -1,9 +1,9 @@
 services:
   tv-telegram-control:
     build: .
-    container_name: tv-telegram-control
+    container_name: ${TV_BOT_CONTAINER_NAME:-tv-telegram-control}
     network_mode: host
-    user: "1000:1000"
+    user: "${TV_BOT_UID:-1000}:${TV_BOT_GID:-1000}"
     restart: unless-stopped
     init: true
     stop_grace_period: 15s
@@ -17,7 +17,7 @@ services:
       TV_BOT_TOKEN_FILE: /run/secrets/telegram_token
       TV_BOT_LOG_DIR: /app/logs
       TV_BOT_HEARTBEAT: /tmp/tv_bot_heartbeat
-      TZ: Asia/Almaty
+      TZ: ${TV_BOT_TIMEZONE:-UTC}
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs

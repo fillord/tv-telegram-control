@@ -9,6 +9,9 @@
 включает анкету клиента, подготовку ADB, протокол испытаний, реестр моделей и
 шаблон технического заключения.
 
+Пошаговая подготовка отдельной установки находится в
+[инструкции для сервера заказчика](docs/deployment/customer-server.md).
+
 ## Возможности
 
 - отдельное управление каждым телевизором и одновременные команды для всех;
@@ -56,9 +59,11 @@ cd tv-telegram-control
 mkdir -p data logs adb secrets
 chmod 700 data adb secrets
 cp config.example.json data/config.json
+cp .env.example .env
 printf '%s\n' 'TOKEN_FROM_BOTFATHER' > secrets/telegram_token
 chmod 600 data/config.json
 chmod 600 secrets/telegram_token
+chmod 600 .env
 ```
 
 ### 3. Конфигурация
@@ -107,7 +112,10 @@ chmod 600 secrets/telegram_token
 
 Если Telegram ID неизвестен, запустите бота с временным числом в `allowed_user_ids`, отправьте боту `/id`, затем внесите полученный ID в конфигурацию.
 
-В `compose.yaml` контейнер запускается как пользователь `1000:1000`. Если `id -u` или `id -g` возвращает другое значение, измените поле `user` в `compose.yaml`.
+В `.env` укажите результат `id -u`, `id -g` и часовой пояс сервера в
+переменных `TV_BOT_UID`, `TV_BOT_GID` и `TV_BOT_TIMEZONE`. Для новой установки
+можно вместо ручного копирования использовать `scripts/init_installation.py` —
+он создаст конфигурацию и запросит токен скрыто.
 
 ### 4. Запуск
 
@@ -156,7 +164,11 @@ docker compose stop
 docker compose start
 ```
 
-Резервное копирование должно включать каталоги `data/`, `secrets/` и `adb/`. Файлы `secrets/telegram_token` и `adb/adbkey` являются закрытыми ключами и не должны публиковаться. `scripts/deploy.sh` автоматически запускает тесты, создаёт резервную копию, разворачивает новую версию, ждёт `healthy` и откатывает образ при ошибке.
+Резервное копирование должно включать каталоги `data/`, `secrets`, `adb/` и файл
+`.env`. Файлы `secrets/telegram_token` и `adb/adbkey` являются закрытыми ключами
+и не должны публиковаться. `scripts/backup.sh` создаёт защищённую копию, а
+`scripts/deploy.sh` автоматически запускает тесты, сохраняет рабочую версию,
+разворачивает обновление, ждёт `healthy` и выполняет откат при ошибке.
 
 ## Подготовка телевизоров
 

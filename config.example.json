@@ -18,18 +18,18 @@
   "status_cache_seconds": 15,
   "status_poll_interval_seconds": 10,
   "history_max_events": 1000,
-  "timezone": "Asia/Almaty",
+  "timezone": "UTC",
   "tvs": [
     {
-      "name": "TCL 43P635 — Телевизор 1",
-      "ip": "192.168.0.108",
+      "name": "Телевизор 1",
+      "ip": "192.168.1.100",
       "port": 5555,
       "url": "https://example.org/tv",
       "mac": "AA:BB:CC:DD:EE:FF",
-      "auto_refresh": true,
-      "group": "Первый этаж",
+      "auto_refresh": false,
+      "group": "Основная группа",
       "schedule": {
-        "enabled": true,
+        "enabled": false,
         "on": "09:00",
         "off": "22:00",
         "days": [
@@ -43,13 +43,6 @@
         ]
       },
       "id": "tv_example_01"
-    },
-    {
-      "name": "Телевизор 2 (пример)",
-      "ip": "192.168.0.109",
-      "port": 5555,
-      "url": "https://example.org/tv",
-      "id": "tv_example_02"
     }
   ]
 }
