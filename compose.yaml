@@ -17,6 +17,7 @@ services:
       TV_BOT_TOKEN_FILE: /run/secrets/telegram_token
       TV_BOT_LOG_DIR: /app/logs
       TV_BOT_HEARTBEAT: /tmp/tv_bot_heartbeat
+      TV_BOT_HTTP_ALLOWED_URLS: ${TV_BOT_HTTP_ALLOWED_URLS:-}
       TZ: ${TV_BOT_TIMEZONE:-UTC}
     volumes:
       - ./data:/app/data

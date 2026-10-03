@@ -178,6 +178,7 @@ def main(argv: list[str] | None = None) -> int:
         f"TV_BOT_UID={os.getuid()}\n"
         f"TV_BOT_GID={os.getgid()}\n"
         f"TV_BOT_TIMEZONE={args.timezone}\n"
+        "TV_BOT_HTTP_ALLOWED_URLS=\n"
     )
     write_private(env_path, env_content)
 

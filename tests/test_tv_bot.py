@@ -120,6 +120,22 @@ class ConfigTests(unittest.TestCase):
 
 
 class ParsingTests(unittest.TestCase):
+    def test_allowlisted_http_url_is_allowed(self):
+        url = "http://192.168.8.249:3000/a"
+        with mock.patch.dict(os.environ, {"TV_BOT_HTTP_ALLOWED_URLS": url}):
+            self.assertEqual(tv_bot.validate_url(url), url)
+
+    def test_unlisted_http_url_is_rejected(self):
+        with mock.patch.dict(os.environ, {"TV_BOT_HTTP_ALLOWED_URLS": ""}):
+            with self.assertRaisesRegex(ValueError, "TV_BOT_HTTP_ALLOWED_URLS"):
+                tv_bot.validate_url("http://192.168.8.249:3000/a")
+
+    def test_http_allowlist_requires_exact_url(self):
+        allowed = "http://192.168.8.249:3000/a"
+        with mock.patch.dict(os.environ, {"TV_BOT_HTTP_ALLOWED_URLS": allowed}):
+            with self.assertRaises(ValueError):
+                tv_bot.validate_url("http://192.168.8.249:3000/other")
+
     def test_quick_add_supports_multiword_name(self):
         ip, port, mac, name, url = tv_bot.parse_addtv_arguments(
             "192.168.0.120 TCL Конференц зал"

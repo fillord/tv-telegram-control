@@ -1563,15 +1563,25 @@ def validate_url(value):
     value = value.strip()
     parsed = urllib.parse.urlsplit(value)
     if (
-        parsed.scheme != "https"
-        or not parsed.hostname
+        not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
     ):
-        raise ValueError("Нужна полная HTTPS-ссылка, например https://example.com/tv")
+        raise ValueError("Нужна полная веб-ссылка без логина и пароля")
     if any(char.isspace() for char in value):
         raise ValueError("В ссылке не должно быть пробелов")
-    return value
+    if parsed.scheme == "https":
+        return value
+    allowed_http_urls = {
+        item.strip()
+        for item in os.environ.get("TV_BOT_HTTP_ALLOWED_URLS", "").split(",")
+        if item.strip()
+    }
+    if parsed.scheme == "http" and value in allowed_http_urls:
+        return value
+    if parsed.scheme == "http":
+        raise ValueError("HTTP-ссылка не включена в TV_BOT_HTTP_ALLOWED_URLS")
+    raise ValueError("Ссылка должна начинаться с https://")
 
 
 def validate_clock(value):
@@ -2718,7 +2728,7 @@ def process(cfg, update):
                 send(
                     cfg, chat_id,
                     f"✅ Название принято: «{name}»\n\n"
-                    "Шаг 4 из 4: Отправьте HTTPS-ссылку сайта для ТВ (начинающуюся с https://), "
+                    "Шаг 4 из 4: Отправьте HTTPS-ссылку или разрешённый внутренний HTTP-адрес, "
                     f"либо нажмите кнопку ниже для ссылки по умолчанию:\n{def_url}\n\n"
                     "Для отмены отправьте /cancel.",
                     markup=markup
@@ -3050,7 +3060,7 @@ def process(cfg, update):
         label = target_label(tvs, target)
         show_screen(
             cfg, chat_id, msg_id,
-            f"Отправьте новую HTTPS-ссылку для {label} одним сообщением.\n"
+            f"Отправьте новую HTTPS-ссылку или разрешённый HTTP-адрес для {label}.\n"
             "Для отмены отправьте /cancel.",
             {"inline_keyboard": [[
                 {"text": "❌ Отмена", "callback_data": f"settings:{target}"}
