@@ -25,6 +25,7 @@
       "ip": "192.168.1.100",
       "port": 5555,
       "url": "https://example.org/tv",
+      "browser_package": "com.yandex.browser.tv",
       "mac": "AA:BB:CC:DD:EE:FF",
       "auto_refresh": false,
       "group": "Основная группа",

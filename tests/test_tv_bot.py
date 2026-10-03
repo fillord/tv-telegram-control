@@ -385,6 +385,20 @@ class DeviceSafetyTests(unittest.TestCase):
     def setUp(self):
         tv_bot.ADB_LAST_RECOVERY = 0.0
 
+    def test_web_action_can_target_configured_browser_package(self):
+        tv = sample_tv()
+        tv["browser_package"] = "com.yandex.browser.tv"
+        with (
+            mock.patch.object(
+                tv_bot, "connect", return_value=("192.168.0.10:5555", "")
+            ),
+            mock.patch.object(tv_bot, "adb", return_value=(True, "Starting")) as adb,
+        ):
+            result = tv_bot._operate_unlocked({}, tv, "web")
+        self.assertTrue(tv_bot.operation_succeeded(result))
+        self.assertIn("-p", adb.call_args.args)
+        self.assertIn("com.yandex.browser.tv", adb.call_args.args)
+
     def test_unknown_power_state_is_not_treated_as_awake(self):
         tv = sample_tv()
         with (

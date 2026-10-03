@@ -307,6 +307,16 @@ def load_config():
         if not (1 <= tv["port"] <= 65535):
             raise ValueError("Неверный ADB-порт")
         tv["url"] = validate_url(tv.get("url", ""))
+        browser_package = str(tv.get("browser_package", "")).strip()
+        if browser_package:
+            if not re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+",
+                browser_package,
+            ):
+                raise ValueError(
+                    f'Некорректный пакет браузера у ТВ «{tv["name"]}»'
+                )
+            tv["browser_package"] = browser_package
         if tv.get("mac"):
             tv["mac"] = validate_mac(tv["mac"])
         if "schedule" in tv:
@@ -1418,11 +1428,13 @@ def _operate_unlocked(cfg, tv, action, url_override=None):
     if action in {"web", "both"}:
         if action == "both":
             time.sleep(3)
-        ok, output = adb(
-            cfg, "-s", address, "shell", "am", "start", "-a",
+        command = [
+            "-s", address, "shell", "am", "start", "-a",
             "android.intent.action.VIEW", "-d", url_override or tv["url"],
-            timeout=20,
-        )
+        ]
+        if tv.get("browser_package"):
+            command.extend(["-p", tv["browser_package"]])
+        ok, output = adb(cfg, *command, timeout=20)
         if not ok or "Error:" in output or "unable to resolve" in output.lower():
             return operation_failure(
                 f"Не удалось открыть сайт: {output[:250]}", "web_failed", output
